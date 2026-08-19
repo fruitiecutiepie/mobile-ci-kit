@@ -10,3 +10,7 @@ local.properties
 
 # Node
 node_modules/
+
+# Generated Xcode project (from project.yml via xcodegen) and build output
+*.xcodeproj/
+DerivedData/

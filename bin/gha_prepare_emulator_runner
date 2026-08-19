@@ -49,14 +49,45 @@ printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kv
 sudo udevadm control --reload-rules
 sudo udevadm trigger --name-match=kvm
 
-# Assert it, rather than assuming the rule applied. A silent failure here turns into a boot timeout
-# 10 minutes later, which is the misdirection this whole script exists to prevent.
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+# `udevadm trigger` is ASYNCHRONOUS -- it queues events and returns. `settle` waits for the queue to
+# drain, and without it the permissions are simply not applied yet when the next command runs.
+#
+# This is not a hypothetical. An earlier version of this script checked `/dev/kvm` immediately after
+# the trigger and turned a WORKING lane red: on one commit, the same script on the same runner image
+# reported "readable and writable" in one job and "still not read-write" in another, purely because
+# the first job happened to run `setup-java` beforehand and the second did not. Same code, opposite
+# results -- which is what proved it was a race rather than a real KVM problem.
+sudo udevadm settle --timeout=30 || note 'udevadm settle timed out; continuing'
+
+# The check is ADVISORY, deliberately, and this is the interesting part.
+#
+# Its value is diagnostic: when the emulator later dies on a boot timeout, this line in the log is
+# the answer. But it must not be a gate, because the empirical evidence is that the emulator boots
+# successfully even in runs where this check was unhappy -- so making it fatal converts a useful hint
+# into a false negative that blocks a working lane. A guard that fires when nothing is wrong gets
+# deleted, and takes its diagnostic value with it.
+kvm_state='unknown'
+i=0
+while [ "$i" -lt 10 ]; do
+  if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    kvm_state='ok'
+    break
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+
+if [ "$kvm_state" = 'ok' ]; then
   note '/dev/kvm is readable and writable'
 else
-  printf '%s: /dev/kvm is still not read-write after applying the udev rule.\n' "$label" >&2
-  printf '%s: the emulator would fall back to software rendering and never finish booting.\n' "$label" >&2
-  exit 1
+  note 'WARNING: /dev/kvm is not read-write after applying the udev rule and settling.'
+  note 'The emulator may fall back to software rendering and never finish booting. If a boot'
+  note 'timeout follows, this is the first thing to read. Continuing anyway: this has been observed'
+  note 'to be a false alarm, and refusing to continue would block a lane that does in fact work.'
+  # `ls -l` on one fixed path, purely to print mode and ownership for a human reading the log.
+  # SC2012's concern is parsing ls output for filenames; nothing here parses anything.
+  # shellcheck disable=SC2012
+  ls -l /dev/kvm 2>&1 | sed "s/^/$label:   /" || true
 fi
 
 note 'reclaiming disk before the emulator boots'

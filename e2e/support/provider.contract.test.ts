@@ -119,6 +119,26 @@ describe("local provider specifics", () => {
     assert.ok(artifact.appiumApp.startsWith("/"), "Appium needs an absolute path for a local app");
   });
 
+  it("does not pass a device class as an iOS deviceName", () => {
+    // Regression test for a real failure. XCUITest reads `appium:deviceName` as a simulator DEVICE
+    // TYPE and tries to create one from it, so `local-modern_phone` fails the session with "Could
+    // not create simulator ... device type id 'local-modern_phone'". Android ignores the field when
+    // one device is attached, so this passes there and fails only on iOS -- which is precisely the
+    // kind of asymmetry a cross-platform suite must not discover in a spec.
+    const caps = new LocalProvider().capabilities({
+      platform: "ios",
+      deviceClass: "modern_phone",
+    });
+    const deviceName = String(caps["appium:deviceName"] ?? "");
+    assert.ok(deviceName.length > 0, "iOS needs a concrete simulator name");
+    for (const cls of DEVICE_CLASSES) {
+      assert.ok(
+        !deviceName.includes(cls),
+        `iOS deviceName must name a real simulator, not the device class (${deviceName})`,
+      );
+    }
+  });
+
   it("carries no vendor-specific capability namespaces", () => {
     // `bstack:options`, `sauce:options` and friends belong to a farm provider. If one appears here,
     // vendor configuration has leaked to the wrong side of the boundary.

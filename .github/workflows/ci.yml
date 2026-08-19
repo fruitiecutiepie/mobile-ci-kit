@@ -234,3 +234,25 @@ jobs:
             e2e/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  ios-xctest:
+    name: iOS tests on a simulator
+    # macOS runners are billed at a higher multiplier on private repos; on a public repo standard
+    # runners are free. The lane needs no Apple Developer account: simulator builds require no code
+    # signing, which is the fact that makes an iOS lane viable at all in open CI.
+    runs-on: macos-15
+    needs: [scripts, lint]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run XCTest on a simulator
+        uses: ./.github/actions/ios-xctest
+        with:
+          working-directory: examples/minimal-ios
+          xcodegen-spec: project.yml
+          project: Minimal.xcodeproj
+          scheme: Minimal
+          # macos-15 images ship iPhone 16-era simulators; the action lists what is available first,
+          # so a wrong name here is one log line away from the right one rather than a guess.
+          simulator: iPhone 16

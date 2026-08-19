@@ -24,7 +24,7 @@ const target: DeviceTarget = {
 const defaultApp =
   platform === "android"
     ? "../examples/minimal-android/app/build/outputs/apk/debug/app-debug.apk"
-    : "../examples/minimal-ios/build/Debug-iphonesimulator/Minimal.app";
+    : "../examples/minimal-ios/build/dd/Build/Products/Debug-iphonesimulator/Minimal.app";
 
 // Awaited at module scope: the config must fail loudly HERE if the app is missing, rather than let
 // every spec fail later with an Appium session error that names the session and not the build.
@@ -49,8 +49,14 @@ export const config: WebdriverIO.Config = {
 
   logLevel: "warn",
   waitforTimeout: 20_000,
-  connectionRetryTimeout: 180_000,
-  connectionRetryCount: 2,
+  // iOS gets a far longer session timeout than Android, for one specific reason: the FIRST XCUITest
+  // session on a machine builds and installs WebDriverAgent, which takes several minutes. A 3-minute
+  // timeout surfaces as `Request timed out!`, which names neither WebDriverAgent nor the build --
+  // observed as a 9-minute failure that looked like a broken Appium install.
+  connectionRetryTimeout: platform === "ios" ? 900_000 : 180_000,
+  // One retry, not two: a retried session that is still building WDA merely doubles the wall-clock
+  // before reporting the same failure.
+  connectionRetryCount: 1,
 
   framework: "mocha",
   reporters: ["spec"],

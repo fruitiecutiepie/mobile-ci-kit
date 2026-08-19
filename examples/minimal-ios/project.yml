@@ -1,0 +1,63 @@
+# XcodeGen spec. The .xcodeproj is GENERATED from this file and gitignored, deliberately.
+#
+# A tracked project.pbxproj is meaningful signing and build configuration that must not be
+# hand-edited, and it merges badly -- two branches adding a file conflict in a format nobody can
+# review. A 40-line YAML spec is reviewable, and regenerating is one command. The trade is a build
+# dependency (`brew install xcodegen`), which is worth it for a fixture whose whole job is to be
+# reproducible.
+name: Minimal
+options:
+  bundleIdPrefix: dev.mobilecikit
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  Minimal:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Minimal
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.mobilecikit.minimal
+        GENERATE_INFOPLIST_FILE: false
+        SWIFT_VERSION: "5.0"
+        # A simulator build needs no signing at all, which is what makes this lane free and
+        # runnable in CI with no Apple Developer account. Stated explicitly so nobody "fixes" it
+        # by adding a team id.
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_ALLOWED: "NO"
+
+  MinimalTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: Minimal
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_ALLOWED: "NO"
+
+schemes:
+  Minimal:
+    build:
+      targets:
+        Minimal: all
+        MinimalTests: [test]
+    test:
+      # `gatherCoverageData` is off: this fixture exists to prove lanes work, not to be measured.
+      targets:
+        - MinimalTests

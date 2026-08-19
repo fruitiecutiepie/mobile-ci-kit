@@ -1,0 +1,110 @@
+name: iOS tests on a simulator, with an executed-count assertion
+description: >-
+  Build and test an Xcode scheme on an iOS Simulator, then assert that tests actually executed.
+  Needs no Apple Developer account and no code signing, because simulator builds require neither --
+  which is what makes this lane free to run in CI.
+
+inputs:
+  working-directory:
+    description: Directory containing the Xcode project or workspace.
+    required: true
+  scheme:
+    description: Scheme to test.
+    required: true
+  project:
+    description: Path to the .xcodeproj, relative to working-directory. Mutually exclusive with workspace.
+    required: false
+    default: ""
+  workspace:
+    description: Path to the .xcworkspace, relative to working-directory. Mutually exclusive with project.
+    required: false
+    default: ""
+  simulator:
+    description: >-
+      Simulator device name. There is no safe default across runner images -- an image ships whichever
+      simulators it ships -- so pass one you have confirmed exists on your runner.
+    required: false
+    default: "iPhone 17"
+  xcodegen-spec:
+    description: >-
+      If set, run `xcodegen generate` with this spec before building. For projects whose .xcodeproj is
+      generated and gitignored rather than tracked.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install XcodeGen
+      if: ${{ inputs.xcodegen-spec != '' }}
+      shell: bash
+      run: brew install xcodegen
+
+    - name: Generate the Xcode project
+      if: ${{ inputs.xcodegen-spec != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: xcodegen generate --spec '${{ inputs.xcodegen-spec }}'
+
+    # Listed on purpose: when a simulator name turns out not to exist on the runner image, the
+    # xcodebuild error is about a destination rather than about a name, and this log is the answer.
+    - name: List available simulators
+      shell: bash
+      run: xcrun simctl list devices available | sed -n '1,40p'
+
+    - name: Run tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TARGET_FLAG: ${{ inputs.project != '' && format('-project {0}', inputs.project) || format('-workspace {0}', inputs.workspace) }}
+      run: |
+        set -euo pipefail
+        if [ -z '${{ inputs.project }}' ] && [ -z '${{ inputs.workspace }}' ]; then
+          printf 'error: pass exactly one of `project` or `workspace`\n' >&2
+          exit 1
+        fi
+        if [ -n '${{ inputs.project }}' ] && [ -n '${{ inputs.workspace }}' ]; then
+          printf 'error: `project` and `workspace` are mutually exclusive\n' >&2
+          exit 1
+        fi
+        # `-resultBundlePath` is what makes the assertion below possible at all. Without it there is
+        # no .xcresult to read a count out of, and the only signal left is xcodebuild's exit code --
+        # which is 0 for a run that executed nothing.
+        #
+        # NOTE: xcodebuild's own output is deliberately not piped through a formatter here. A pipeline
+        # would mask xcodebuild's exit status unless `pipefail` is set, and this repo has been bitten
+        # by exactly that shape elsewhere; `set -o pipefail` above is what makes it safe.
+        # shellcheck disable=SC2086
+        xcodebuild test \
+          $TARGET_FLAG \
+          -scheme '${{ inputs.scheme }}' \
+          -destination 'platform=iOS Simulator,name=${{ inputs.simulator }}' \
+          -resultBundlePath build/result.xcresult \
+          -derivedDataPath build/dd \
+          CODE_SIGNING_ALLOWED=NO
+
+    # THE POINT OF THIS ACTION. `xcodebuild test` can print a suite tree in which every line says
+    # `passed` while having executed zero tests, and it emits no `** TEST FAILED **` in that state.
+    # Without this step the lane is green and verifies nothing.
+    - name: Assert tests actually executed
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CHECK: ${{ github.action_path }}/../../../bin/ios_test_result_check
+      run: |
+        set -euo pipefail
+        if [ ! -x "$CHECK" ]; then
+          printf 'error: guard not found or not executable at %s\n' "$CHECK" >&2
+          exit 1
+        fi
+        "$CHECK" build/result.xcresult
+
+    - name: Upload the result bundle
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ios-xcresult-${{ inputs.scheme }}
+        path: ${{ inputs.working-directory }}/build/result.xcresult
+        if-no-files-found: ignore
+        retention-days: 7
