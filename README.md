@@ -6,7 +6,17 @@ the traps behind them — the ones where a gate reports success while having ver
 Everything here was extracted from a working Capacitor/iOS/Android production repo, where each trap
 below was found the hard way. The traps are the point; the code is what enforces them.
 
-Requires POSIX `sh` and `awk`. No `jq`, no Python, no Node. MIT — copy any file into your own repo.
+The scripts require only POSIX `sh` and `awk` — no `jq`, no Python, no Node. MIT: copy any file into
+your own repo.
+
+**The headline result:** one Appium spec, selecting only on accessibility ids, passes **unchanged** on
+both an Android emulator and an iOS simulator — no platform branching, no vendor SDK, and no Apple
+Developer account (simulator builds need no code signing). Verified on real devices, not asserted:
+
+```
+[app-debug.apk Android #0-0]  ✓ updates the result text when the target is tapped   (1 passing)
+[Minimal.app   iOS     #0-0]  ✓ updates the result text when the target is tapped   (1 passing)
+```
 
 ---
 
@@ -224,14 +234,53 @@ untested compatibility claim is the kind of thing this repo exists to argue agai
 
 ---
 
+## Reusable workflows
+
+For adopting a whole lane rather than composing steps yourself:
+
+```yaml
+jobs:
+  android:
+    uses: fruitiecutiepie/mobile-ci-kit/.github/workflows/android-instrumentation.yml@main
+    with:
+      working-directory: client/android
+
+  ios:
+    uses: fruitiecutiepie/mobile-ci-kit/.github/workflows/ios-xctest.yml@main
+    with:
+      working-directory: client/ios
+      project: App.xcodeproj
+      scheme: App
+      simulator: iPhone 16
+```
+
+Both check this kit out into `.mobile-ci-kit/` and call the composite action from there. That is not
+incidental: a reusable workflow **cannot** `uses:` a local action from the calling repository, because
+the path resolves against the caller's checkout, which does not contain this kit. Prefer the composite
+actions directly when you need your own steps interleaved with the run.
+
+## What is verified, and how
+
+Nothing in this README describes a lane without a green CI run behind it. Specifically:
+
+| Claim | How it is verified |
+| --- | --- |
+| The iOS guard works on a real `.xcresult` | Run against one produced by a real simulator test run, reporting `2 test(s) executed` |
+| The Android guard reads the run total, not a per-class copy | Run against a real report; reports `tests=1`, not `2` |
+| `connectedDebugAndroidTest` is green with zero tests | Deleted the only test from the source set on a real emulator; `BUILD SUCCESSFUL`, empty results directory |
+| The emulator lane works on a GitHub runner | Green CI job; the guard logged `1 test(s) executed` |
+| The Appium spec is not vacuous | Removed the tap; the spec fails on a real emulator |
+| The same spec runs on both platforms | Passed on an Android emulator and an iOS simulator, spec byte-identical |
+| The leak check can detect a leak | Planted `bs://` in a spec; the grep reported it |
+| Both guards' suites can fail | Eight mutations, all caught (table above) |
+
 ## Roadmap
 
-Present today, each with a green CI run behind it: both false-green guards, their suites, the
-emulator composite action, the two run-control scripts, and two write-ups. Planned, and deliberately
-**not** described above until the same is true of them:
+Everything described above is present and exercised by this repo's own CI. Still to come:
 
-- An iOS simulator lane, and the same spec running unchanged on both platforms — which is what the
-  matching accessibility ids in `examples/minimal-android` exist for. Simulators need no code signing,
-  so it needs no Apple Developer account.
 - The portable subset of a larger CI trap index (a new gate being advisory-only until wired into two
   places; `awk` being mawk on Ubuntu; POSIX `sh` having no `pipefail`).
+- A device-farm provider, if and when there is an account to verify one against. The contract test and
+  the worked mappings in [docs/appium-portability.md](docs/appium-portability.md) are what make that a
+  small change rather than a migration — and writing one unverified is exactly what this repo argues
+  against.

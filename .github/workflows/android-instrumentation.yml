@@ -1,0 +1,71 @@
+name: Android instrumentation (reusable)
+
+# Reusable wrapper around .github/actions/android-emulator-test, so another repository adopts the
+# whole lane -- emulator tuning, executed-count assertion, report upload -- in about five lines:
+#
+#   jobs:
+#     android:
+#       uses: fruitiecutiepie/mobile-ci-kit/.github/workflows/android-instrumentation.yml@main
+#       with:
+#         working-directory: client/android
+#
+# Prefer the composite action when you need to interleave your own steps around the run; prefer this
+# when you want the whole job.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the Gradle project.
+        required: true
+        type: string
+      gradle-task:
+        required: false
+        type: string
+        default: ":app:connectedDebugAndroidTest"
+      results-dir:
+        required: false
+        type: string
+        default: "app/build/outputs/androidTest-results/connected"
+      api-level:
+        required: false
+        type: string
+        default: "36"
+      runs-on:
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+      timeout-minutes:
+        required: false
+        type: number
+        default: 45
+
+permissions:
+  contents: read
+
+jobs:
+  instrumentation:
+    name: Android instrumentation (API ${{ inputs.api-level }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Checked out separately because a reusable workflow cannot `uses:` a local action from the
+      # CALLING repository -- the path would resolve against the caller's checkout, which does not
+      # contain this kit. Pinning the ref here is deliberate: it is what makes the lane reproducible
+      # for a consumer.
+      - name: Check out mobile-ci-kit
+        uses: actions/checkout@v6
+        with:
+          repository: fruitiecutiepie/mobile-ci-kit
+          ref: main
+          path: .mobile-ci-kit
+
+      - name: Run instrumentation tests on an emulator
+        uses: ./.mobile-ci-kit/.github/actions/android-emulator-test
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          gradle-task: ${{ inputs.gradle-task }}
+          results-dir: ${{ inputs.results-dir }}
+          api-level: ${{ inputs.api-level }}

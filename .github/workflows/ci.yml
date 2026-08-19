@@ -256,3 +256,88 @@ jobs:
           # macos-15 images ship iPhone 16-era simulators; the action lists what is available first,
           # so a wrong name here is one log line away from the right one rather than a guess.
           simulator: iPhone 16
+
+  appium-ios:
+    name: Appium on an iOS simulator
+    runs-on: macos-15
+    needs: [scripts, lint, e2e-contract]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        working-directory: examples/minimal-ios
+        run: xcodegen generate
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: npm ci
+
+      # `build`, not `build-for-testing`: the Appium lane drives the app, and the XCTest bundle is
+      # the other lane's business.
+      - name: Build the app for the simulator
+        working-directory: examples/minimal-ios
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available | sed -n '1,40p'
+          xcodebuild build \
+            -project Minimal.xcodeproj \
+            -scheme Minimal \
+            -destination "platform=iOS Simulator,name=$SIMULATOR" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO
+        env:
+          SIMULATOR: iPhone 16
+
+      # Boot it here and pass the udid, rather than letting Appium pick or create a simulator: a
+      # pinned, already-booted device is both faster and deterministic. `simctl boot` on an
+      # already-booted device is an error, so the state is checked rather than assumed.
+      - name: Boot the simulator and export its udid
+        env:
+          SIMULATOR: iPhone 16
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available \
+            | grep -E "^ *$SIMULATOR \(" \
+            | grep -oE '[0-9A-F-]{36}' | head -1)"
+          if [ -z "$udid" ]; then
+            printf 'error: no available simulator named %s on this runner image\n' "$SIMULATOR" >&2
+            printf 'the list above is what it actually ships\n' >&2
+            exit 1
+          fi
+          state="$(xcrun simctl list devices | grep "$udid" | grep -oE '\((Booted|Shutdown)\)' || true)"
+          if [ "$state" != '(Booted)' ]; then
+            xcrun simctl boot "$udid"
+          fi
+          xcrun simctl bootstatus "$udid" -b
+          printf 'IOS_SIMULATOR_UDID=%s\n' "$udid" >> "$GITHUB_ENV"
+
+      # The FIRST XCUITest session builds and installs WebDriverAgent, which takes several minutes on
+      # a cold runner. The provider's WDA timeouts are generous for exactly this reason; a short
+      # timeout here surfaces as `Request timed out!` and names neither WDA nor the build.
+      - name: Run the Appium suite
+        working-directory: e2e
+        env:
+          TARGET_PLATFORM: ios
+          APP_PATH: ../examples/minimal-ios/build/dd/Build/Products/Debug-iphonesimulator/Minimal.app
+        run: npm run test:android
+
+      - name: Upload Appium logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: appium-ios-logs
+          path: |
+            e2e/logs/
+            e2e/*.log
+          if-no-files-found: ignore
+          retention-days: 7

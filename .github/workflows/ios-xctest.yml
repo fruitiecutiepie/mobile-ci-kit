@@ -1,0 +1,79 @@
+name: iOS XCTest (reusable)
+
+# Reusable wrapper around .github/actions/ios-xctest:
+#
+#   jobs:
+#     ios:
+#       uses: fruitiecutiepie/mobile-ci-kit/.github/workflows/ios-xctest.yml@main
+#       with:
+#         working-directory: client/ios
+#         project: App.xcodeproj
+#         scheme: App
+#         simulator: iPhone 16
+#
+# Needs no Apple Developer account: simulator builds require no code signing.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+      scheme:
+        required: true
+        type: string
+      project:
+        required: false
+        type: string
+        default: ""
+      workspace:
+        required: false
+        type: string
+        default: ""
+      simulator:
+        description: >-
+          Confirm this exists on your runner image. The action lists available simulators before
+          building, so a wrong name is one log line away from the right one.
+        required: false
+        type: string
+        default: "iPhone 16"
+      xcodegen-spec:
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        required: false
+        type: string
+        default: "macos-15"
+      timeout-minutes:
+        required: false
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  xctest:
+    name: iOS XCTest on ${{ inputs.simulator }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out mobile-ci-kit
+        uses: actions/checkout@v6
+        with:
+          repository: fruitiecutiepie/mobile-ci-kit
+          ref: main
+          path: .mobile-ci-kit
+
+      - name: Run XCTest on a simulator
+        uses: ./.mobile-ci-kit/.github/actions/ios-xctest
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          scheme: ${{ inputs.scheme }}
+          project: ${{ inputs.project }}
+          workspace: ${{ inputs.workspace }}
+          simulator: ${{ inputs.simulator }}
+          xcodegen-spec: ${{ inputs.xcodegen-spec }}
