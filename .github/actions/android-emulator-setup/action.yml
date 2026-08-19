@@ -1,0 +1,47 @@
+name: Prepare a runner to boot an Android emulator
+description: >-
+  The runner-level prerequisites for booting an Android emulator on a standard GitHub-hosted Linux
+  runner: KVM access and enough free disk. Split out from android-emulator-test so any lane that
+  boots an emulator (instrumentation, Appium, a screenshot run) shares one copy of the tuning
+  instead of three drifting copies.
+
+inputs:
+  java-version:
+    description: JDK version for Gradle. Pass an empty string to skip JDK/Gradle setup entirely.
+    required: false
+    default: "17"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      if: ${{ inputs.java-version != '' }}
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java-version }}
+
+    - name: Set up Gradle
+      if: ${{ inputs.java-version != '' }}
+      uses: gradle/actions/setup-gradle@v5
+
+    # Hardware-accelerated virtualisation IS available on standard 2-vCPU GitHub-hosted Linux
+    # runners, but the runner user cannot open /dev/kvm until this rule is installed. Without it the
+    # emulator silently falls back to software rendering and effectively never finishes booting -- and
+    # the symptom is the boot timeout expiring, which reads like a broken AVD or a bad system image
+    # rather than a permissions problem. That misdirection is why this is step one.
+    # KVM access and disk headroom, via the shared script so both emulator lanes use ONE copy of the
+    # tuning. `github.action_path` points at this action inside the checked-out kit, so the script is
+    # found whether the kit IS the repo or is being consumed from another one -- unlike a `uses: ./`
+    # path, whose resolution differs between those two cases.
+    - name: Prepare the runner for an emulator
+      shell: bash
+      env:
+        PREPARE: ${{ github.action_path }}/../../../bin/gha_prepare_emulator_runner
+      run: |
+        set -euo pipefail
+        if [ ! -x "$PREPARE" ]; then
+          printf 'error: %s not found or not executable\n' "$PREPARE" >&2
+          exit 1
+        fi
+        "$PREPARE"

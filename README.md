@@ -29,6 +29,8 @@ Every entry is a real observed failure, not a hypothetical.
 | The emulator never finishes booting; the boot timeout expires | The runner user cannot open `/dev/kvm`, so it silently falls back to software rendering. **The symptom looks like a broken AVD** | [emulator action](.github/actions/android-emulator-test/action.yml) — install the KVM udev rule first |
 | The emulator dies ~0.4s after launch, then the job burns its whole timeout | `Not enough space to create userdata partition`. `pixel_6` defaults to ~7.4 GB; the runner has a few GB free. The emulator action then polls for a device that will never appear | free disk **before** boot and set `disk-size: 6144M` |
 | A faster emulator lane quietly stops testing what it exists for | `google_atd` images disable hardware rendering, so anything that renders (WebView, Compose, custom `View`) becomes structurally uncoverable — while still passing | use `google_apis` for any rendering surface |
+| Switching device farms means editing every test | The farm's uploaded-app handle, vendor capability namespace, or device names leaked into specs | [provider boundary](e2e/providers/provider.ts) — three methods; assert it with a grep in CI |
+| A device class silently resolves to nothing on one farm | Nothing forced each provider to handle every class | [contract test](e2e/support/provider.contract.test.ts) — assert every class on every platform |
 | A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
 Full reasoning: **[docs/false-green-tests.md](docs/false-green-tests.md)**.
@@ -119,11 +121,52 @@ Two traps encoded in them, both of which cost real debugging time:
 
 ---
 
+## `e2e/` — WebdriverIO + Appium, with a thin provider boundary
+
+One spec, selecting only on accessibility ids, driving a real emulator. The point is that it is
+**provider-agnostic**: the same spec runs locally or on a device farm, and switching is a config
+change plus one provider file, not a migration.
+
+```sh
+cd e2e
+npm ci
+npm run test:contract   # 12 device-free assertions: the provider contract
+npm run typecheck
+npm run test:android    # needs an emulator; Appium is started/stopped by the run
+```
+
+The entire vendor-shaped surface is three methods:
+
+```ts
+interface DeviceProvider {
+  endpoint(): ProviderEndpoint;
+  capabilities(target: DeviceTarget): ProviderCapabilities;
+  prepareApp(localPath: string): Promise<AppArtifact>;
+}
+```
+
+Three anti-goals, each with a reason in [docs/appium-portability.md](docs/appium-portability.md):
+
+* **No wrapper around Appium.** A `MobileDriver` with `click()`/`type()` rebuilds WebDriver behind a
+  worse interface. WebDriver semantics are already the portable part.
+* **No vendor app identifier above the boundary.** A farm's upload handle never reaches a spec, so
+  "switch provider" never means "edit every test".
+* **No hard-coded device names.** Selection is semantic (`modern_flagship`, `oldest_supported`) and the
+  provider resolves it against real inventory.
+
+**There is deliberately no `browserstack.ts` here.** A stub no test exercises is unverifiable code that
+reads like a working integration. What exists instead is checkable: a contract test defining what any
+provider must satisfy, plus the farm mappings as worked examples in the docs. CI also greps the specs
+for vendor strings and platform branching, so the boundary is asserted rather than trusted.
+
+---
+
 ## Tests, and why they are mutation-tested
 
 ```sh
 tests/ios_test_result_check_test        # 46 assertions, no Xcode needed
 tests/android_test_result_check_test    # 31 assertions, no emulator/SDK/gradle needed
+cd e2e && npm run test:contract         # 12 assertions, no Appium/device needed
 ```
 
 A guard that cannot fail reports success exactly like a working one — which is the bug this repo is
@@ -140,6 +183,8 @@ Currently caught:
 | Android | treat an empty results directory as fine | `an empty results directory is indeterminate, never a pass` |
 | Android | count skipped tests as executed | `an all-skipped run fails` |
 | Android | stop refusing the opt-out under CI | `the opt-out is refused when CI is set` |
+| Appium spec | remove the tap, keeping both assertions | the spec fails on a real emulator (proved, not assumed) |
+| Leak check | plant `bs://` in a spec | the grep reports it (control-tested; a check that cannot fail is worthless) |
 
 Three disciplines are baked into the suite, each earned by an assertion that passed while covering
 nothing:
@@ -163,7 +208,12 @@ config. Copy the one you need, and copy its suite from `tests/` if you want the 
 holding.
 
 **Just the action.** `uses: fruitiecutiepie/mobile-ci-kit/.github/actions/android-emulator-test@main`
-with a `working-directory`. Nothing else in the kit needs to exist for it.
+with a `working-directory`. Nothing else in the kit needs to exist for it. If you only want the
+emulator prerequisites and will run your own command, use `android-emulator-setup` instead — both call
+one shared `bin/gha_prepare_emulator_runner`, so the tuning cannot drift between them.
+
+**Just the boundary.** Copy `e2e/providers/provider.ts` and the contract test; implement it for
+whatever you actually run on.
 
 **Just the reasoning.** `docs/false-green-tests.md` stands alone. If you only change one thing after
 reading it, assert an executed count.
@@ -180,9 +230,8 @@ Present today, each with a green CI run behind it: both false-green guards, thei
 emulator composite action, the two run-control scripts, and two write-ups. Planned, and deliberately
 **not** described above until the same is true of them:
 
-- A WebdriverIO + Appium harness against local emulators/simulators, with the provider boundary kept
-  thin enough that a device farm is a config change rather than a migration.
-- The same for an iOS simulator, and one shared spec running unchanged on both platforms — which is
-  what the matching accessibility ids in `examples/minimal-android` exist for.
+- An iOS simulator lane, and the same spec running unchanged on both platforms — which is what the
+  matching accessibility ids in `examples/minimal-android` exist for. Simulators need no code signing,
+  so it needs no Apple Developer account.
 - The portable subset of a larger CI trap index (a new gate being advisory-only until wired into two
   places; `awk` being mawk on Ubuntu; POSIX `sh` having no `pipefail`).

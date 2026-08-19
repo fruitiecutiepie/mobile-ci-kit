@@ -111,3 +111,126 @@ jobs:
         with:
           working-directory: examples/minimal-android
           api-level: ${{ matrix.api-level }}
+
+  e2e-contract:
+    name: Provider contract and typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install
+        working-directory: e2e
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: e2e
+        run: npm run typecheck
+
+      # Device-free and milliseconds: no Appium, no emulator, no network. This is the executable
+      # definition of what a device-farm provider must satisfy, which is why this repo ships no stub
+      # farm provider -- see docs/appium-portability.md.
+      - name: Provider contract
+        working-directory: e2e
+        run: npm run test:contract
+
+      # The portability claim, asserted rather than described. If a vendor string or a platform
+      # branch appears in a spec or screen object, the boundary has leaked and this fails.
+      - name: Assert the suite stays provider-agnostic
+        run: |
+          set -euo pipefail
+          leaks=0
+
+          # Comment lines are excluded, because this repo's own specs DISCUSS the things the check
+          # forbids -- the spec explains why `driver.isAndroid` would be a red flag, and that sentence
+          # tripped the check on its first run. The filter is a deliberate heuristic (leading `*`,
+          # `//` or `/*`), not a TypeScript parse: it is worth stating that a `platformName` inside a
+          # multi-line string would slip through, and that this is a nudge rather than a proof.
+          code_only() {
+            grep -rniE "$1" e2e/specs e2e/screens | grep -vE ':[0-9]+:[[:space:]]*(\*|//|/\*)' || true
+          }
+
+          # Vendor namespaces and app-identifier schemes belong to a provider, never to a spec.
+          vendor="$(code_only 'bstack:|sauce:|lambdatest|browserstack|bs://|testmu')"
+          if [ -n "$vendor" ]; then
+            printf 'error: a vendor reference leaked into specs/screens:\n%s\n' "$vendor" >&2
+            leaks=1
+          fi
+
+          # Platform branching in a spec means the accessibility ids stopped being the contract.
+          branching="$(code_only 'isAndroid|isIOS|isIos|platformName')"
+          if [ -n "$branching" ]; then
+            printf 'error: platform branching leaked into specs/screens:\n%s\n' "$branching" >&2
+            leaks=1
+          fi
+          # A grep that matches nothing exits 1 and looks identical to a clean pass, so prove the
+          # files were actually searched.
+          searched=$(find e2e/specs e2e/screens -name '*.ts' | wc -l | tr -d ' ')
+          if [ "$searched" -eq 0 ]; then
+            printf 'error: no spec or screen files were searched, so this step proved nothing\n' >&2
+            exit 1
+          fi
+          printf 'searched %s spec/screen file(s), %s leak(s)\n' "$searched" "$leaks"
+          exit "$leaks"
+
+  appium-android:
+    name: Appium on an Android emulator (API ${{ matrix.api-level }})
+    runs-on: ubuntu-24.04
+    needs: [scripts, lint, e2e-contract]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [36]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      # Emulator prerequisites, from the same shared script the instrumentation lane uses.
+      - name: Prepare the runner for an emulator
+        uses: ./.github/actions/android-emulator-setup
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Build the fixture APK
+        working-directory: examples/minimal-android
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      # The Appium server is started and stopped by @wdio/appium-service inside the run, so there is
+      # no `appium &` step here and no orphan server if the run fails.
+      - name: Run the Appium suite
+        uses: reactivecircus/android-emulator-runner@v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disk-size: 6144M
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back emulated -no-metrics
+          working-directory: e2e
+          script: npm run test:android
+
+      - name: Upload Appium logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: appium-android-logs-api${{ matrix.api-level }}
+          path: |
+            e2e/logs/
+            e2e/*.log
+          if-no-files-found: ignore
+          retention-days: 7

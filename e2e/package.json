@@ -1,0 +1,27 @@
+{
+  "name": "mobile-ci-kit-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WebdriverIO + Appium harness with a thin provider boundary",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:contract": "node --experimental-strip-types --test support/provider.contract.test.ts",
+    "test:android": "wdio run wdio.conf.ts",
+    "test:ios": "TARGET_PLATFORM=ios wdio run wdio.conf.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.2",
+    "@wdio/appium-service": "9.31.1",
+    "@wdio/cli": "9.31.1",
+    "@wdio/globals": "9.31.1",
+    "@wdio/local-runner": "9.31.1",
+    "@wdio/mocha-framework": "9.31.1",
+    "@wdio/spec-reporter": "9.31.1",
+    "appium": "3.6.0",
+    "appium-uiautomator2-driver": "8.4.0",
+    "appium-xcuitest-driver": "12.5.0",
+    "typescript": "5.9.3",
+    "webdriverio": "9.31.1"
+  }
+}
