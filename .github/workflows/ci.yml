@@ -14,15 +14,16 @@ permissions:
   contents: read
 
 jobs:
-  shell:
-    name: Shell checks and script tests
+  scripts:
+    name: Script syntax and regression suite
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
-      # Every shipped script must parse under a real POSIX sh. `bash -n` would accept bashisms that
-      # `sh` rejects, and these scripts claim POSIX compatibility -- so check with what they claim.
+      # Every shipped script must parse under a real POSIX sh. Note this runner's `sh` is dash,
+      # while macOS `sh` is bash in POSIX mode and accepts bashisms dash rejects -- so a script
+      # validated only on macOS is not validated for the shell it claims.
       - name: Syntax-check every script under sh
         run: |
           set -eu
@@ -40,14 +41,46 @@ jobs:
           fi
           printf 'syntax-checked %d script(s)\n' "$found"
 
-      - name: shellcheck
-        run: |
-          set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          shellcheck --shell=sh bin/* tests/*
-
       # The suite drives --summary-json, so it needs no Xcode and runs here rather than on a macOS
       # runner. Same parse and same assertions as the .xcresult path.
       - name: ios_test_result_check regression suite
         run: tests/ios_test_result_check_test
+
+  lint:
+    name: shellcheck ${{ matrix.shellcheck }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two PINNED versions, both required. The scripts here are meant to be copied into other
+        # repos, so "clean under shellcheck" is a claim about more than one version -- and an
+        # untested compatibility claim is exactly the kind this repo exists to argue against.
+        #
+        # These two specifically: 0.9.0 is what Ubuntu 24.04's apt ships, and 0.11.0 is current.
+        # They disagree about the same code -- 0.9.0 reports SC2317 on a trap-invoked function's
+        # body, 0.11.0 reports SC2329 on its declaration -- so a `# shellcheck disable=` directive
+        # naming only one ID passes on one version and fails on the other. That is a real CI failure
+        # this repo hit on its first push, and the reason the version is pinned rather than apt's.
+        shellcheck: [v0.9.0, v0.11.0]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run shellcheck ${{ matrix.shellcheck }}
+        env:
+          SHELLCHECK_VERSION: ${{ matrix.shellcheck }}
+        run: |
+          set -eu
+          tmp="$(mktemp -d)"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ -C "$tmp"
+          sc="$tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          # Assert the pin took effect. Without this, a moved release URL or a changed archive layout
+          # would leave `$sc` missing or fall back to some other binary, and the step could pass while
+          # linting with a version nobody chose -- or while linting nothing at all.
+          "$sc" --version
+          "$sc" --version | grep -qx "version: ${SHELLCHECK_VERSION#v}" || {
+            printf 'error: expected shellcheck %s\n' "${SHELLCHECK_VERSION#v}" >&2
+            exit 1
+          }
+          "$sc" --shell=sh bin/* tests/*

@@ -101,8 +101,11 @@ case "${1:-}" in
 esac
 
 scratch="$(mktemp -d)"
-# Invoked by the `trap` below, which shellcheck cannot see.
-# shellcheck disable=SC2329
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration, and this
+# file is meant to be copied into repos running either. (Note the wording: a comment line that
+# STARTS with the linter's own name is parsed as a directive and errors with SC1073.)
+# shellcheck disable=SC2329,SC2317
 cleanup() {
   rm -rf "$scratch"
   return 0

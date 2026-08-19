@@ -23,6 +23,7 @@ Every entry is a real observed failure, not a hypothetical.
 | A test-count parser is correct in dev and wrong in CI | `xcresulttool` summaries are **not flat**: `devicesAndConfigurations[]` repeats the counts per destination. A whole-text scan reads a per-device count as the run total. The first draft was written against an *empty* bundle, where that array is `[]` | parse top-level members only — see the `summary_counts` awk in the script |
 | A required gate goes permanently red one day, for no code change | `--schema-version` was pinned; Apple retired that version, and CI's Xcode auto-upgrades | don't pin it — assert on the count **fields** and fail closed |
 | A required gate was silently switched off | An `ALLOW_ZERO_TESTS`-style env var set in a workflow step, with nothing detecting it | refuse the escape hatch when `CI` is set |
+| A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
 Full reasoning: **[docs/false-green-tests.md](docs/false-green-tests.md)**.
 
@@ -99,6 +100,10 @@ with `-resultBundlePath`. No dependencies beyond POSIX `sh`, `awk`, and Xcode 16
 
 **Just the reasoning.** `docs/false-green-tests.md` stands alone. If you only change one thing after
 reading it, assert an executed count.
+
+The scripts are linted under **shellcheck 0.9.0 and 0.11.0** on every push, because "clean under
+shellcheck" is a claim about more than one version and these two disagree about the same code. An
+untested compatibility claim is the kind of thing this repo exists to argue against.
 
 ---
 
