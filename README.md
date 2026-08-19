@@ -43,7 +43,16 @@ Every entry is a real observed failure, not a hypothetical.
 | A device class silently resolves to nothing on one farm | Nothing forced each provider to handle every class | [contract test](e2e/support/provider.contract.test.ts) — assert every class on every platform |
 | A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
+| A check script works on your Mac and misbehaves on the runner | Ubuntu's `/usr/bin/awk` is **mawk**, macOS ships BSD awk. mawk's `{n,m}` interval quantifiers cannot be relied on, and the failure can be a silent "matched nothing" | [`ci.yml`](.github/workflows/ci.yml) — run the suites under **both** mawk and gawk, and assert the shim took effect |
+| A mid-pipeline failure reads downstream as "found nothing" | POSIX `sh` has no `pipefail`; only the last stage's status survives. Two failed reads both yield `""`, so `"" = ""` reports "same" and the caller acts on a conclusion it never computed | already gated: `shellcheck --shell=sh` reports **SC3040** for `set -o pipefail` in a `sh` script, under both pinned versions |
+
 Full reasoning: **[docs/false-green-tests.md](docs/false-green-tests.md)**.
+
+**Twenty entries, indexed by symptom:** [docs/ci-traps.md](docs/ci-traps.md) — traps where the first
+plausible explanation is wrong, across shell portability, git, the Actions platform, builds that exit
+0 while lying, and devices. Each is marked **gate** / **measured** / **observed**, so you can tell
+what is enforced here from what is reported from a repo you cannot see. (A few of them are the rows
+above, in full.)
 
 ---
 
@@ -273,13 +282,15 @@ Nothing in this README describes a lane without a green CI run behind it. Specif
 | The same spec runs on both platforms | Passed on an Android emulator and an iOS simulator, spec byte-identical |
 | The leak check can detect a leak | Planted `bs://` in a spec; the grep reported it |
 | Both guards' suites can fail | Eight mutations, all caught (table above) |
+| The awk matrix catches a real divergence | Injected gawk's `gensub()`: mawk leg red, gawk leg green, identical code |
+| The awk shim actually takes effect | Requested gawk while shimming mawk; the assertion fired and the step exited 1 |
+| `pipefail` in a `sh` script is caught | `SC3040` under shellcheck 0.9.0 **and** 0.11.0 |
+| `checkbashisms` would have added nothing | Ten bashism probes: it caught nothing shellcheck missed, and **missed** `set -o pipefail`. Dropped rather than added |
 
 ## Roadmap
 
 Everything described above is present and exercised by this repo's own CI. Still to come:
 
-- The portable subset of a larger CI trap index (a new gate being advisory-only until wired into two
-  places; `awk` being mawk on Ubuntu; POSIX `sh` having no `pipefail`).
 - A device-farm provider, if and when there is an account to verify one against. The contract test and
   the worked mappings in [docs/appium-portability.md](docs/appium-portability.md) are what make that a
   small change rather than a migration — and writing one unverified is exactly what this repo argues

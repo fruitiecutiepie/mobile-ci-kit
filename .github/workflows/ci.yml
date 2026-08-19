@@ -88,6 +88,63 @@ jobs:
           }
           "$sc" --shell=sh bin/* tests/*
 
+  awk-portability:
+    name: awk portability (${{ matrix.awk }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both required. The two guards in bin/ parse with awk, and awk implementations genuinely
+        # differ -- this matrix is not ceremony. Measured while building it: injecting gawk's
+        # `gensub()` into one guard turns the mawk leg RED while the gawk leg stays GREEN on identical
+        # code. That divergence is the whole justification.
+        #
+        # Why it matters beyond this repo: macOS ships one-true-awk (BSD), Debian/Ubuntu's /usr/bin/awk
+        # is mawk, and mawk's ERE interval-quantifier support (`{n,m}`) cannot be relied on. A check
+        # script written and validated on a Mac is UNVALIDATED for the Ubuntu runner that enforces it,
+        # and the failure can be a silent "matched nothing" rather than an error.
+        #
+        # A third implementation is already covered without a job: the ios-xctest lane runs on macOS,
+        # so BSD awk is exercised there. busybox awk is deliberately NOT a leg -- there is no brew
+        # formula, so it cannot be dry-run locally, and a gate whose first execution is in CI is how
+        # this repo's shellcheck-version bug got in.
+        awk: [mawk, gawk]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install ${{ matrix.awk }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.awk }}
+
+      # A shim directory rather than `update-alternatives`, and rather than threading an $AWK variable
+      # through the guards: production scripts should not carry a seam that exists only for their own
+      # tests. The scripts call `awk` bare; PATH decides which one that is.
+      - name: Run both guard suites under ${{ matrix.awk }}
+        run: |
+          set -euo pipefail
+          shim="$(mktemp -d)"
+          ln -s "$(command -v ${{ matrix.awk }})" "$shim/awk"
+          export PATH="$shim:$PATH"
+
+          # ASSERT THE SHIM TOOK EFFECT. Without this the job passes while running the runner's
+          # default awk, reporting coverage of an implementation it never used -- the same shape as
+          # the unpinned-linter bug recorded in the README trap index.
+          actual="$(awk --version 2>/dev/null | head -1 || awk -W version 2>&1 | head -1)"
+          printf 'awk in use: %s\n' "$actual"
+          case "${{ matrix.awk }}" in
+            mawk) printf '%s' "$actual" | grep -q '^mawk' ;;
+            gawk) printf '%s' "$actual" | grep -q '^GNU Awk' ;;
+          esac || {
+            printf 'error: PATH shim did not take effect; got %s\n' "$actual" >&2
+            exit 1
+          }
+
+          tests/ios_test_result_check_test
+          tests/android_test_result_check_test
+
   android:
     name: Android instrumentation on an emulator (API ${{ matrix.api-level }})
     runs-on: ubuntu-24.04
