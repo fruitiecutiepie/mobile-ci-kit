@@ -1,0 +1,374 @@
+#!/bin/sh
+# ios_test_result_check_test -- regression suite for bin/ios_test_result_check.
+#
+# Hermetic and Xcode-free: every case drives the checker's `--summary-json` mode with fixtures, so
+# this runs on Linux in CI. Same parse, same assertions as the production `.xcresult` path; only the
+# source of the JSON differs.
+#
+# Why the suite is shaped this way. The *negative* cases are the ones that matter, and no CI job can
+# reach them through a real `xcodebuild` run -- provoking a genuine zero-test run means crashing the
+# test host on purpose. So they are exercised here. Three disciplines are baked in, each of which was
+# earned by an assertion that passed while covering nothing:
+#
+#   1. CONTROL ASSERTIONS. A script that rejected all input would satisfy every negative case, so a
+#      realistic passing run is asserted first, and the opt-out cases are bracketed by a case proving
+#      the same fixture fails again once the flag is unset.
+#   2. FIXTURE VALIDITY. A fixture that is accidentally invalid JSON passes the negative cases for the
+#      wrong reason and silently guts the positive ones. Fixtures meant to be well-formed are
+#      validated, and the guard announces itself when it cannot run rather than passing quietly.
+#   3. NON-CANCELLING TRAPS. The brace fixture uses deliberately UNBALANCED closers: a balanced pair
+#      cancels out, so a parser with no string tracking re-syncs to the same depth and produces
+#      identical output -- the assertion passes while covering nothing.
+#
+# Usage: tests/ios_test_result_check_test
+# Exit: 0 all assertions passed, 1 one or more failed.
+set -eu
+
+# `CDPATH=` is a deliberate one-shot prefix assignment for `cd`, not a broken assignment: an
+# inherited CDPATH would make `cd --` resolve somewhere else entirely.
+# shellcheck disable=SC1007
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ios_check="$repo_root/bin/ios_test_result_check"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT INT TERM
+
+failures=0
+cases=0
+
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/      /' >&2
+  fi
+}
+
+pass() {
+  cases=$((cases + 1))
+  printf 'ok: %s\n' "$1"
+}
+
+if [ -x "$ios_check" ]; then
+  pass 'bin/ios_test_result_check exists and is executable'
+else
+  fail "bin/ios_test_result_check is missing or not executable: $ios_check"
+fi
+
+# $1 fixture name, then passed, failed, skipped, expectedFailures, totalTestCount.
+summary() {
+  printf '{"expectedFailures":%s,"failedTests":%s,"passedTests":%s,"result":"x","skippedTests":%s,"totalTestCount":%s}' \
+    "$5" "$3" "$2" "$4" "$6" >"$scratch/$1.json"
+  printf '%s\n' "$scratch/$1.json"
+}
+
+json_validator=''
+if command -v python3 >/dev/null 2>&1; then
+  json_validator='python3'
+else
+  printf 'note: python3 absent, JSON fixture validity NOT checked in this run\n' >&2
+fi
+
+assert_valid_json() {
+  [ -n "$json_validator" ] || return 0
+  if "$json_validator" -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" 2>/dev/null; then
+    pass "fixture is well-formed JSON: $(basename "$1")"
+  else
+    fail "fixture is not valid JSON, so any assertion about it proves nothing: $1" "$(cat "$1")"
+  fi
+}
+
+check_status=0
+check_output=''
+# Set to 1 for the opt-out cases only. Passed per-invocation rather than exported, so it cannot leak
+# into a later case and turn a real assertion into a silent pass.
+allow_zero=''
+# Set to 1 only for the case asserting the opt-out is REFUSED in CI.
+simulate_ci=''
+
+run_check() {
+  # `CI`/`GITHUB_ACTIONS` are pinned on EVERY invocation, never inherited. This suite runs in CI,
+  # where `GITHUB_ACTIONS=true` is already in the environment -- so inheriting it would make the
+  # opt-out case (which expects the local behaviour) pass locally and fail on the runner, and the
+  # refusal case pass on the runner for the wrong reason. Both directions are stated per case.
+  ci_env='GITHUB_ACTIONS= CI='
+  if [ -n "$simulate_ci" ]; then
+    ci_env='GITHUB_ACTIONS=true CI=true'
+  fi
+  # A non-zero exit is the expected result in most of these cases, so `set -e` must not abort on it.
+  set +e
+  # `$ci_env` is unquoted deliberately: it carries two `NAME=VALUE` words for `env`, and word
+  # splitting is how they are delivered. Quoting it would pass one argument containing a space,
+  # which `env` reads as a single variable name -- silently failing to pin the CI markers, which is
+  # exactly the confound these cases exist to exclude.
+  # shellcheck disable=SC2086
+  if [ -n "$allow_zero" ]; then
+    check_output="$(env $ci_env IOS_TEST_ALLOW_ZERO_TESTS=1 "$ios_check" "$@" 2>&1)"
+  else
+    check_output="$(env $ci_env "$ios_check" "$@" 2>&1)"
+  fi
+  check_status=$?
+  set -e
+}
+
+# $1 description, $2 expected exit code, then the checker's arguments.
+expect_status() {
+  expect_description="$1"
+  expect_code="$2"
+  shift 2
+  run_check "$@"
+  if [ "$check_status" -eq "$expect_code" ]; then
+    pass "$expect_description"
+  else
+    fail "$expect_description (expected exit $expect_code, got $check_status)" "$check_output"
+  fi
+}
+
+# --- Control assertion. Every negative case below could pass for the wrong reason. ---
+expect_status 'a run that executed tests passes' 0 \
+  --summary-json "$(summary realistic 48 1 2 0 51)"
+
+# --- The motivating case: host crashed, XCTest restarted it, nothing left to run. ---
+expect_status 'a zero-test run fails' 1 \
+  --summary-json "$(summary zero 0 0 0 0 0)"
+if printf '%s' "$check_output" | grep -q 'no test was executed'; then
+  pass 'the zero-test failure says no test was executed'
+else
+  fail 'the zero-test failure should name the executed count' "$check_output"
+fi
+
+# --- `totalTestCount` includes skipped tests, so counting it alone would call this a pass. ---
+expect_status 'an all-skipped run fails' 1 \
+  --summary-json "$(summary all_skipped 0 0 3 0 3)"
+if printf '%s' "$check_output" | grep -q 'every test was skipped'; then
+  pass 'the all-skipped failure is distinguished from a zero-test one'
+else
+  fail 'the all-skipped failure should say every test was skipped' "$check_output"
+fi
+
+# --- A run with one real failure still ran: this check must not duplicate the suite's verdict. ---
+expect_status 'a run whose tests all failed still counts as having run' 0 \
+  --summary-json "$(summary all_failed 0 4 0 0 4)"
+
+# --- expectedFailures is a term of the executed count in its own right. Without this fixture,
+# --- dropping that term from the sum survives every other case.
+expect_status 'a run of only expected failures counts as having run' 0 \
+  --summary-json "$(summary only_expected 0 0 0 4 4)"
+
+# --- Fail closed on anything unreadable, and distinguishably (3, never 1). ---
+printf '%s' '{"result":"x"}' >"$scratch/no_fields.json"
+expect_status 'a summary missing the count fields is indeterminate, not a pass' 3 \
+  --summary-json "$scratch/no_fields.json"
+
+printf '%s' '{"totalTestCount":5,"passedTests":5,"passedTests":5,"failedTests":0,"skippedTests":0,"expectedFailures":0}' \
+  >"$scratch/duplicate_key.json"
+expect_status 'a repeated top-level count key is indeterminate, not a guess' 3 \
+  --summary-json "$scratch/duplicate_key.json"
+
+# --- The real shape: `devicesAndConfigurations[]` repeats the per-destination counts, so a
+# --- whole-text scan sees each count twice and cannot tell which is the run total.
+cat >"$scratch/one_destination.json" <<'SUMMARY'
+{
+  "devicesAndConfigurations" : [
+    {
+      "device" : { "deviceName" : "iPhone 17", "platform" : "iOS Simulator" },
+      "expectedFailures" : 0,
+      "failedTests" : 0,
+      "passedTests" : 51,
+      "skippedTests" : 2
+    }
+  ],
+  "expectedFailures" : 0,
+  "failedTests" : 0,
+  "passedTests" : 51,
+  "result" : "Passed",
+  "skippedTests" : 2,
+  "totalTestCount" : 53
+}
+SUMMARY
+assert_valid_json "$scratch/one_destination.json"
+expect_status 'the real nested-duplicate summary shape parses' 0 \
+  --summary-json "$scratch/one_destination.json"
+if printf '%s' "$check_output" | grep -q 'totalTestCount=53 passed=51 failed=0 skipped=2'; then
+  pass 'the top-level counts are read, not the per-destination copies'
+else
+  fail 'the counts should come from the top level of the summary' "$check_output"
+fi
+
+# --- Two destinations: a scan that summed or last-wrote the nested copies would report 2x or a
+# --- per-device count.
+cat >"$scratch/two_destinations.json" <<'SUMMARY'
+{
+  "devicesAndConfigurations" : [
+    { "expectedFailures" : 0, "failedTests" : 0, "passedTests" : 4, "skippedTests" : 0 },
+    { "expectedFailures" : 0, "failedTests" : 0, "passedTests" : 4, "skippedTests" : 0 }
+  ],
+  "expectedFailures" : 0,
+  "failedTests" : 0,
+  "passedTests" : 8,
+  "result" : "Passed",
+  "skippedTests" : 0,
+  "totalTestCount" : 8
+}
+SUMMARY
+assert_valid_json "$scratch/two_destinations.json"
+expect_status 'a two-destination summary still reads one top-level total' 0 \
+  --summary-json "$scratch/two_destinations.json"
+if printf '%s' "$check_output" | grep -q '8 test(s) executed'; then
+  pass 'a multi-destination run reports the run total, not a per-device count'
+else
+  fail 'a multi-destination run should report the top-level total' "$check_output"
+fi
+
+# --- A zero-test run in the real shape must still be the gate firing (1), not a parse error (3). ---
+cat >"$scratch/nested_zero.json" <<'SUMMARY'
+{
+  "devicesAndConfigurations" : [
+    { "expectedFailures" : 0, "failedTests" : 0, "passedTests" : 0, "skippedTests" : 0 }
+  ],
+  "expectedFailures" : 0,
+  "failedTests" : 0,
+  "passedTests" : 0,
+  "result" : "unknown",
+  "skippedTests" : 0,
+  "totalTestCount" : 0
+}
+SUMMARY
+assert_valid_json "$scratch/nested_zero.json"
+expect_status 'a zero-test run in the real summary shape fails as the gate, not as a parse error' 1 \
+  --summary-json "$scratch/nested_zero.json"
+
+# --- Braces inside a string value must not desynchronise depth tracking. The closers are
+# --- deliberately UNBALANCED (net -3): a balanced pair cancels out and the assertion covers nothing.
+cat >"$scratch/string_braces.json" <<'SUMMARY'
+{
+  "testFailures" : [
+    { "failureText" : "expected {\"a\":1} but got }}} instead" }
+  ],
+  "expectedFailures" : 0,
+  "failedTests" : 1,
+  "passedTests" : 2,
+  "skippedTests" : 0,
+  "totalTestCount" : 3
+}
+SUMMARY
+assert_valid_json "$scratch/string_braces.json"
+expect_status 'unbalanced braces inside a string value do not break the parse' 0 \
+  --summary-json "$scratch/string_braces.json"
+if printf '%s' "$check_output" | grep -q 'totalTestCount=3 passed=2 failed=1'; then
+  pass 'depth tracking survives unbalanced braces inside string values'
+else
+  fail 'an unbalanced brace inside a string value desynchronised the parse' "$check_output"
+fi
+
+# --- Escape tracking: a `\"` before a `{` must not read as ending the string (the `{` would open a
+# --- phantom level and hide every count after it). The trailing `\\` is the companion trap.
+cat >"$scratch/string_escapes.json" <<'SUMMARY'
+{
+  "testFailures" : [
+    { "failureText" : "got \" then { and \" then } plus a trailing backslash \\" }
+  ],
+  "expectedFailures" : 0,
+  "failedTests" : 1,
+  "passedTests" : 4,
+  "skippedTests" : 0,
+  "totalTestCount" : 5
+}
+SUMMARY
+assert_valid_json "$scratch/string_escapes.json"
+expect_status 'escaped quotes next to braces do not break the parse' 0 \
+  --summary-json "$scratch/string_escapes.json"
+if printf '%s' "$check_output" | grep -q 'totalTestCount=5 passed=4 failed=1'; then
+  pass 'backslash-escape tracking survives quotes adjacent to braces'
+else
+  fail 'an escaped quote next to a brace desynchronised the parse' "$check_output"
+fi
+
+# --- A count that is not a canonical non-negative integer must land on 3, never 1 and never 0.
+# --- Shell arithmetic is the hazard: `08` aborts it, `010` is octal, `53.0` truncates, `-51` is nonsense.
+expect_status 'a leading-zero count is indeterminate, not a verdict' 3 \
+  --summary-json "$(summary octal_ambiguous 010 0 0 0 010)"
+expect_status 'a count shell arithmetic cannot evaluate is indeterminate' 3 \
+  --summary-json "$(summary bad_base 08 0 0 0 8)"
+expect_status 'a negative count is indeterminate' 3 \
+  --summary-json "$(summary negative -51 0 0 0 53)"
+expect_status 'a fractional count is indeterminate, not silently truncated' 3 \
+  --summary-json "$(summary fractional 53.0 0 0 0 53.0)"
+
+# --- Nothing executed and skippedTests does not account for the total: neither the crash/filter
+# --- explanation nor the all-skipped one is true, and saying "every test was skipped" next to
+# --- `skipped=0` sends the reader after a skip condition that is not there.
+expect_status 'inconsistent counts with nothing executed still fail' 1 \
+  --summary-json "$(summary inconsistent 0 0 0 0 5)"
+if printf '%s' "$check_output" | grep -q 'do not account for the total'; then
+  pass 'counts that do not add up are reported as such, not as an all-skipped run'
+else
+  fail 'inconsistent counts should not be reported as every test being skipped' "$check_output"
+fi
+
+expect_status 'a missing summary file is indeterminate' 3 \
+  --summary-json "$scratch/does-not-exist.json"
+expect_status 'a missing result bundle is indeterminate' 3 \
+  "$scratch/does-not-exist.xcresult"
+
+# --- Present but unreadable as a result bundle. Exit 3 for different internal reasons per platform
+# --- (no `xcrun` on Linux, `xcresulttool` rejecting the directory on macOS) -- the point is that
+# --- neither platform reports a pass, so only the code is asserted.
+mkdir -p "$scratch/empty.xcresult"
+expect_status 'an unreadable result bundle is indeterminate on any platform' 3 \
+  "$scratch/empty.xcresult"
+
+# --- The opt-out relaxes the assertion, not the ability to read a result. ---
+allow_zero=1
+
+expect_status 'IOS_TEST_ALLOW_ZERO_TESTS=1 downgrades a zero-test run to a warning' 0 \
+  --summary-json "$(summary opt_out 0 0 0 0 0)"
+if printf '%s' "$check_output" | grep -q 'WARNING'; then
+  pass 'the opt-out still warns loudly that nothing was verified'
+else
+  fail 'the opt-out should warn that nothing was verified' "$check_output"
+fi
+
+# --- The headline invariant is "the opt-out never suppresses code 3", and code 3 has several routes.
+# --- Asserting only the earliest one leaves the others free to be relaxed -- verified by mutation:
+# --- adding an opt-out escape to the schema-change branch survived a suite that checked only one.
+expect_status 'the opt-out does not suppress a missing result bundle' 3 \
+  "$scratch/does-not-exist.xcresult"
+expect_status 'the opt-out does not suppress a missing summary file' 3 \
+  --summary-json "$scratch/does-not-exist.json"
+expect_status 'the opt-out does not suppress a schema change' 3 \
+  --summary-json "$scratch/no_fields.json"
+expect_status 'the opt-out does not suppress an unparseable count' 3 \
+  --summary-json "$scratch/negative.json"
+expect_status 'the opt-out does not suppress an unreadable bundle directory' 3 \
+  "$scratch/empty.xcresult"
+
+# --- Refused under CI: a required gate must not be switchable off by one line of YAML. Same
+# --- fixture, same flag, only the CI markers differ.
+simulate_ci=1
+expect_status 'the opt-out is refused when CI is set' 1 \
+  --summary-json "$scratch/opt_out.json"
+if printf '%s' "$check_output" | grep -q 'refused in CI'; then
+  pass 'the CI refusal says why it refused'
+else
+  fail 'the CI refusal should name CI as the reason' "$check_output"
+fi
+simulate_ci=''
+
+allow_zero=''
+
+# --- Control assertion for the flag itself: the fixture the opt-out just allowed must fail again.
+# --- Otherwise the cases above would pass identically if the flag were ignored entirely.
+expect_status 'the same fixture fails again once the opt-out is unset' 1 \
+  --summary-json "$scratch/opt_out.json"
+
+# --- Usage errors are distinct from verdicts. ---
+expect_status 'no argument is a usage error, distinct from a verdict' 2
+expect_status 'an unknown option is a usage error' 2 --nope
+expect_status 'a second positional argument is a usage error' 2 one two
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf 'ios_test_result_check_test: %d failure(s) across %d passing assertion(s)\n' "$failures" "$cases" >&2
+  exit 1
+fi
+printf 'ios_test_result_check_test: %d assertion(s) passed\n' "$cases"

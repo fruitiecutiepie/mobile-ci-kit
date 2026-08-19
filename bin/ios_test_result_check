@@ -1,0 +1,330 @@
+#!/bin/sh
+# ios_test_result_check -- fail an iOS test run that executed nothing.
+#
+# `xcodebuild test` can print a suite tree in which every line says `passed` while having run zero
+# tests, and it emits no `** TEST FAILED **` in that state. So neither its output nor its exit code
+# is a reliable "tests actually ran" signal. The executed count is. This script is the assertion
+# that reads it.
+#
+# Observed for real, and the reason this exists: an `Info-Debug.plist` was missing
+# `NSCameraUsageDescription`, iOS killed the test host the instant it touched the camera, XCTest
+# restarted the host twice, and each launch reported `Executed 0 tests, with 0 failures`. The probe
+# ran nothing across three launches and looked green. A human grepping the log for expected evidence
+# lines caught it; no gate did.
+#
+# This is one of three distinct ways an iOS test run passes having tested nothing. The other two --
+# a test target absent from the scheme's `<TestableReference>` list, and one present but marked
+# `skipped = "YES"` -- are visible in the .xcscheme BEFORE `xcodebuild` runs, and are best asserted
+# there. That is exactly why a scheme check cannot see THIS one: here the scheme is valid and the app
+# dies at runtime. See docs/false-green-tests.md for all three plus the Android equivalent.
+#
+# Usage:
+#   ios_test_result_check <path-to-.xcresult>      # production: read the result bundle
+#   ios_test_result_check --summary-json <file>    # a summary JSON already on disk
+#
+# The second form exists so the assertions are testable without Xcode -- tests/ios_test_result_check_test
+# runs on Linux, where `xcresulttool` does not exist. Both forms run the same parse and the same
+# assertions, so the tested path IS the production path; only the source of the JSON differs.
+#
+# Exit codes, deliberately distinct so a caller (and the test suite) can tell the reasons apart:
+#   0  at least one test really executed
+#   1  the run tested nothing -- this gate firing
+#   2  usage error
+#   3  indeterminate: no result bundle, `xcresulttool` failed, the summary schema changed, or a
+#      count is not a readable non-negative integer. Fail closed. An unreadable result is not
+#      evidence of a passing run -- and it must not masquerade as code 1 either, since that is a
+#      definite claim about what the run did.
+#
+# `IOS_TEST_ALLOW_ZERO_TESTS=1` downgrades code 1 to a loud warning, for a genuinely zero-test
+# invocation. Two things it deliberately does NOT do: suppress code 3 (on any of its routes -- "I
+# could not read the result" is a different claim from "I read it and zero is expected", and only
+# the second is ever intentional), and work at all under `CI`/`GITHUB_ACTIONS`, so a required gate
+# cannot be switched off by an env var in a workflow step.
+#
+# Requires: POSIX sh, awk, and (for the .xcresult form) Xcode 16+ for
+# `xcresulttool get test-results summary`. No jq, no Python, no Node.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+label='ios-test-result-check'
+
+# Deliberately NOT pinning `--schema-version`. An earlier draft pinned `0.1.0` to make a schema
+# change loud, which reads well but buys nothing and adds a cliff: `xcresulttool` errors on a version
+# it no longer offers ("Unknown schema version provided"), CI runs on `macos-latest` whose Xcode
+# auto-upgrades, and exit 3 is not bypassable — so the day Apple retires `0.1.0` this required gate
+# goes permanently red and the rational response is to delete the check. The pin was also redundant:
+# what this script actually depends on is the five top-level count FIELDS, and the exactly-once guard
+# below already fails closed if any of them is renamed, moved or duplicated. Fields are the contract;
+# the version string never was.
+
+usage() {
+  printf '%s\n' 'Usage: scripts/ios_test_result_check <path-to-.xcresult>'
+  printf '%s\n' '       scripts/ios_test_result_check --summary-json <file>'
+}
+
+note() {
+  printf '%s: %s\n' "$label" "$1" >&2
+}
+
+summary_json=''
+result_bundle=''
+
+case "${1:-}" in
+  '')
+    usage >&2
+    exit 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --summary-json)
+    summary_json="${2:-}"
+    if [ -z "$summary_json" ] || [ "$#" -gt 2 ]; then
+      usage >&2
+      exit 2
+    fi
+    ;;
+  -*)
+    note "unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+  *)
+    result_bundle="$1"
+    if [ "$#" -gt 1 ]; then
+      usage >&2
+      exit 2
+    fi
+    ;;
+esac
+
+scratch="$(mktemp -d)"
+# Invoked by the `trap` below, which shellcheck cannot see.
+# shellcheck disable=SC2329
+cleanup() {
+  rm -rf "$scratch"
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+if [ -n "$result_bundle" ]; then
+  # A missing bundle is the shape a run takes when `xcodebuild` died before writing one. Treat it as
+  # indeterminate rather than absent-and-therefore-fine.
+  if [ ! -e "$result_bundle" ]; then
+    note "no result bundle at: $result_bundle"
+    note 'The test run produced no result bundle, so nothing proves a test ran. Check the'
+    note 'xcodebuild output above for a build or launch failure.'
+    exit 3
+  fi
+
+  if ! command -v xcrun >/dev/null 2>&1; then
+    note 'xcrun not found, so the result bundle cannot be read.'
+    note 'This check must run where Xcode is installed; use --summary-json for a captured summary.'
+    exit 3
+  fi
+
+  summary_json="$scratch/summary.json"
+  if ! xcrun xcresulttool get test-results summary \
+    --path "$result_bundle" \
+    --compact > "$summary_json" 2> "$scratch/xcresulttool.err"; then
+    note "xcresulttool could not summarise: $result_bundle"
+    sed "s/^/$label:   /" "$scratch/xcresulttool.err" >&2 || true
+    note 'If it rejected the subcommand itself, the toolchain is older than Xcode 16, which is where'
+    # Single quotes are correct: this is prose containing backticks, not a command substitution.
+    # shellcheck disable=SC2016
+    note '`get test-results summary` arrived. Otherwise the bundle is incomplete -- a run that died'
+    note 'before writing results leaves one without an Info.plist.'
+    exit 3
+  fi
+elif [ ! -f "$summary_json" ]; then
+  note "no such summary JSON file: $summary_json"
+  exit 3
+fi
+
+# Read the five counts out of the summary in one pass. Prints either
+#   OK <total> <passed> <failed> <skipped> <expectedFailures>
+# or `ERR <key> <match-count>` when a key was not found exactly once.
+#
+# Two things are happening, and the first is not optional tidying.
+#
+# 1. Only TOP-LEVEL members are considered. The summary is NOT flat: `devicesAndConfigurations[]`
+#    repeats `passedTests`, `failedTests`, `skippedTests` and `expectedFailures` per destination, so
+#    a naive whole-text scan sees each of them twice for a one-destination run -- and once more per
+#    extra destination, silently reading a per-device count as the run total. (Learned the hard way:
+#    a scan written against an *empty* result bundle, where that array is `[]`, looked correct until
+#    the first real run.) `totalTestCount` happens to appear only at the top level today, which is
+#    exactly the kind of coincidence not to build on. Nested objects and arrays are therefore elided
+#    by tracking brace depth, with string- and escape-awareness so a `{`, `}` or quote inside a
+#    string value cannot desynchronise it.
+#
+# 2. Each key must match EXACTLY once in what remains. That is the safety argument for parsing JSON
+#    with awk at all: if a future schema renames a field, drops it, or repeats it at the top level,
+#    the count stops being 1 and the caller fails closed instead of reading the wrong number. A JSON
+#    parser is not available unconditionally -- `jq` is not present by default on GitHub's macOS
+#    runners or on a stock developer machine, and a required CI gate must not depend on an optional
+#    tool. `awk` is in POSIX and is everywhere this ever runs.
+#
+# A quoted string at the top level (`title`, `environmentDescription`) is kept, so a test-plan name
+# containing a literal `"passedTests":5` would read as a second match. That direction is safe -- it
+# fails closed with a schema message -- and JSON escaping makes it hard to do by accident: an
+# embedded quote arrives as `\"` or `"`, neither of which matches the pattern.
+summary_counts() {
+  awk '
+    BEGIN {
+      key_count = split("totalTestCount passedTests failedTests skippedTests expectedFailures", want, " ")
+      depth = 0
+      in_string = 0
+      escaped = 0
+      top = ""
+    }
+    {
+      line = $0
+      n = length(line)
+      for (i = 1; i <= n; i += 1) {
+        c = substr(line, i, 1)
+        if (in_string) {
+          if (depth == 1) { top = top c }
+          if (escaped) { escaped = 0 }
+          else if (c == "\\") { escaped = 1 }
+          else if (c == "\"") { in_string = 0 }
+          continue
+        }
+        if (c == "\"") { in_string = 1; if (depth == 1) { top = top c }; continue }
+        if (c == "{" || c == "[") { depth += 1; if (depth == 1) { top = top c }; continue }
+        if (c == "}" || c == "]") { if (depth == 1) { top = top c }; depth -= 1; continue }
+        if (depth == 1) { top = top c }
+      }
+      # A line break at depth 1 separates members; keep it as whitespace so two members on
+      # consecutive lines cannot be concatenated into one token.
+      if (!in_string && depth >= 1) { top = top " " }
+    }
+    END {
+      out = ""
+      for (k = 1; k <= key_count; k += 1) {
+        key = want[k]
+        # Matches more than a non-negative integer on purpose: a sign and a fractional part are
+        # captured so the shell can REJECT them below. A tighter pattern would silently read `-51`
+        # as `51` and `53.0` as `53`.
+        pattern = "\"" key "\"[ \t]*:[ \t]*-?[0-9]+(\\.[0-9]+)?"
+        matches = 0
+        value = ""
+        rest = top
+        while (match(rest, pattern)) {
+          found = substr(rest, RSTART, RLENGTH)
+          sub(/^.*:[ \t]*/, "", found)
+          matches += 1
+          value = found
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+        if (matches != 1) { printf "ERR %s %d\n", key, matches; exit 0 }
+        out = out " " value
+      }
+      printf "OK%s\n", out
+    }
+  ' "$1"
+}
+
+# Deliberately unquoted: the awk output is a fixed-shape line of digits and identifiers, and word
+# splitting is how it is read. Parsing here, in the main shell, rather than in a command
+# substitution per field, so a schema failure can `exit` the script directly -- an `exit` inside
+# `$(...)` only leaves the subshell, and would need `set -e` to propagate.
+# shellcheck disable=SC2046
+set -- $(summary_counts "$summary_json")
+
+case "${1:-}" in
+  OK) ;;
+  ERR)
+    note "expected exactly one top-level \"${2:-?}\" in the xcresult summary, found ${3:-?}"
+    note 'The summary schema changed. Update this script rather than loosening the parse -- a'
+    note 'loose parse would read zero and report a false failure, or worse, a false pass.'
+    exit 3
+    ;;
+  *)
+    note 'could not read the test counts out of the xcresult summary.'
+    note 'Neither an OK nor an ERR line came back, so the summary is not JSON this script knows.'
+    exit 3
+    ;;
+esac
+
+total_tests="$2"
+passed_tests="$3"
+failed_tests="$4"
+skipped_tests="$5"
+expected_failures="$6"
+
+# Every count must be a canonical non-negative integer before it reaches `$(( ))`, which is neither
+# safe nor honest with anything else: `08` aborts the arithmetic with "value too great for base" and
+# the script then exits 1 -- a definite "nothing ran" verdict for a value it could not even read --
+# while `010` is silently taken as octal 8, and `53.0` would truncate. None of those can come from
+# `xcresulttool` (JSON forbids leading zeros, and these are integer counts), but `--summary-json`
+# accepts a file from anywhere, and "unreadable" must land on 3, never on 1 and never on 0.
+for count_name in totalTestCount:"$total_tests" passedTests:"$passed_tests" \
+  failedTests:"$failed_tests" skippedTests:"$skipped_tests" expectedFailures:"$expected_failures"; do
+  count_value="${count_name#*:}"
+  case "$count_value" in
+    '' | *[!0-9]*)
+      note "\"${count_name%%:*}\" is not a non-negative integer: $count_value"
+      note 'Refusing to guess what the run did from a count this script cannot read.'
+      exit 3
+      ;;
+    0) ;;
+    0*)
+      note "\"${count_name%%:*}\" has a leading zero, which shell arithmetic reads as octal: $count_value"
+      note 'Refusing to guess; a canonical JSON integer never has one.'
+      exit 3
+      ;;
+  esac
+done
+
+# `totalTestCount` includes skipped tests, so it alone cannot distinguish "ran the suite" from "the
+# whole suite skipped itself" -- the silent-skip class. A scheme-level check catches the statically
+# declared form of that, but it can still arrive at RUNTIME if a skip condition becomes
+# unconditionally true, which is why the executed count is asserted here too.
+executed_tests=$((passed_tests + failed_tests + expected_failures))
+counts="totalTestCount=$total_tests passed=$passed_tests failed=$failed_tests skipped=$skipped_tests expectedFailures=$expected_failures"
+
+if [ "$total_tests" -gt 0 ] && [ "$executed_tests" -gt 0 ]; then
+  printf '%s: OK (%d test(s) executed; %s)\n' "$label" "$executed_tests" "$counts"
+  exit 0
+fi
+
+if [ "${IOS_TEST_ALLOW_ZERO_TESTS:-}" = '1' ]; then
+  # Refused under CI on purpose. This is meant to be a REQUIRED gate, so an env var in a workflow
+  # step could switch it off with nothing detecting that it had been switched off. Turning the gate
+  # off in CI should cost a reviewed change to this file, not one line of YAML.
+  if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ]; then
+    note "IOS_TEST_ALLOW_ZERO_TESTS=1 is refused in CI ($counts)"
+    note 'The escape hatch is for local and ad-hoc device runs. If a CI job genuinely needs a'
+    note 'zero-test invocation, change this script in a reviewed PR and say which job and why.'
+    exit 1
+  fi
+  note "WARNING: no test executed, allowed by IOS_TEST_ALLOW_ZERO_TESTS=1 ($counts)"
+  note 'Nothing about this run was verified. Unset that variable to make it a failure again.'
+  exit 0
+fi
+
+if [ "$total_tests" -eq 0 ]; then
+  note "no test was executed at all ($counts)"
+  note 'Two things produce this, and the log reads as a pass either way:'
+  note '  * the test host crashed on launch and XCTest restarted it with nothing left to run'
+  note '    (check the log for "Restarting after unexpected exit" and fix the crash -- a missing'
+  note '    Info.plist usage description is one cause);'
+  note '  * an -only-testing: filter that matched no test (check the identifier for a typo).'
+elif [ "$skipped_tests" -eq "$total_tests" ]; then
+  note "every test was skipped, so nothing was verified ($counts)"
+  note 'A suite that skips itself entirely reports success. Check whether a skip condition became'
+  note 'unconditionally true, or whether this destination can run these tests at all.'
+else
+  # Reached when nothing executed but the skipped count does not account for the total either, so
+  # neither of the explanations above is true. Saying "every test was skipped" next to `skipped=0`
+  # -- which an earlier version did -- sends the reader hunting for a skip condition that is not
+  # there. The verdict is still 1: whatever the totals mean, zero tests executed.
+  note "no test was executed, and the counts do not account for the total ($counts)"
+  note 'passed + failed + expectedFailures is zero while totalTestCount is not, and skippedTests'
+  note 'does not cover the difference. Read the .xcresult bundle directly rather than trusting any'
+  note 'of these numbers.'
+fi
+note 'If a zero-test run is genuinely intended here, set IOS_TEST_ALLOW_ZERO_TESTS=1 and say why.'
+exit 1

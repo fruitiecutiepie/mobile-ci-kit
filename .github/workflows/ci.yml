@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push supersedes the first: cancel the older run rather than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell checks and script tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # Every shipped script must parse under a real POSIX sh. `bash -n` would accept bashisms that
+      # `sh` rejects, and these scripts claim POSIX compatibility -- so check with what they claim.
+      - name: Syntax-check every script under sh
+        run: |
+          set -eu
+          found=0
+          for f in bin/* tests/*; do
+            [ -f "$f" ] || continue
+            printf 'sh -n %s\n' "$f"
+            sh -n "$f"
+            found=$((found + 1))
+          done
+          # A loop over a glob that matched nothing exits 0 and looks identical to a clean pass.
+          if [ "$found" -eq 0 ]; then
+            printf 'error: no scripts were checked, so this step proved nothing\n' >&2
+            exit 1
+          fi
+          printf 'syntax-checked %d script(s)\n' "$found"
+
+      - name: shellcheck
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh bin/* tests/*
+
+      # The suite drives --summary-json, so it needs no Xcode and runs here rather than on a macOS
+      # runner. Same parse and same assertions as the .xcresult path.
+      - name: ios_test_result_check regression suite
+        run: tests/ios_test_result_check_test
