@@ -1,0 +1,58 @@
+#!/bin/sh
+# gha_stop_if_superseded -- fail fast when a newer commit has already landed on this PR branch.
+#
+# Run it early in an expensive job. If the branch head has moved since this run started, the run's
+# verdict is about code nobody is waiting on, so stop before paying for an emulator boot or a macOS
+# runner. `concurrency: cancel-in-progress` covers most of this, but not a job that had already
+# started, and not the window between the push and GitHub acting on it.
+#
+# Requires, in the step env:
+#   GITHUB_HEAD_REF (set automatically on pull_request) or HEAD_REF
+#   HEAD_SHA        -- pass ${{ github.event.pull_request.head.sha }}
+#
+# Exit: 0 current, 1 superseded, 2 usage/missing env.
+#
+# THE TRAP THIS SCRIPT ENCODES, which cost a real debugging session: the fetch below is deliberately
+# NOT an unconditional `--depth=1`.
+#
+# `--depth=1` is free on a job whose checkout was already shallow. But on a job that paid for
+# `fetch-depth: 0` -- because something downstream needs a merge-base or history -- an unconditional
+# `--depth=1` here writes a NEW shallow boundary at this branch's tip into `.git/shallow`, even
+# though the checkout was full. That graft then poisons every later history-dependent git command in
+# the SAME checkout for the rest of the job: `git log`'s default merge simplification can report the
+# now-parentless-looking branch tip as ADDING a file that was actually added years earlier, and
+# `git merge-base` can silently return a wrong, too-recent answer instead of erroring.
+#
+# Reproduced against a real job's exact checkout+fetch sequence: `git rev-parse
+# --is-shallow-repository` flips false -> true immediately after this one fetch, with no other
+# command touching it. So only ask to deepen-limit when the repo is ALREADY shallow.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: gha_stop_if_superseded' >&2
+  exit 2
+fi
+
+head_ref="${GITHUB_HEAD_REF:-${HEAD_REF:-}}"
+head_sha="${HEAD_SHA:-}"
+
+if [ -z "$head_ref" ] || [ -z "$head_sha" ]; then
+  printf '%s\n' 'Missing GITHUB_HEAD_REF/HEAD_REF or HEAD_SHA.' >&2
+  exit 2
+fi
+
+if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+  git fetch --depth=1 origin "$head_ref"
+else
+  git fetch origin "$head_ref"
+fi
+latest_sha="$(git rev-parse "origin/$head_ref")"
+
+if [ "$latest_sha" != "$head_sha" ]; then
+  printf 'Superseded: run is on %s but branch head is %s\n' "$head_sha" "$latest_sha" >&2
+  exit 1
+fi
+
+printf 'gha_stop_if_superseded: still current (%s)\n' "$head_sha"

@@ -1,0 +1,55 @@
+#!/bin/sh
+# gha_cancel_run -- cancel this workflow run because a required check has already failed.
+#
+# Call it from an `if: failure()` step at the end of each required job. The PR's verdict is decided
+# the moment any required job goes red, so everything still queued or running is pure waste -- and
+# the worst offenders start late. Measured on one real run: a cheap check failed 9 seconds in, yet
+# the macOS job (10x billing) still started 6m27s later and the emulator job (45m timeout) 9m08s
+# later. Both ran to completion for a verdict that was already decided.
+#
+# TWO THINGS MAKE OR BREAK THIS.
+#
+# 1. It only works if your jobs gate on `!cancelled()`, NOT `always()`. GitHub re-evaluates every
+#    running job's `if` on cancellation and keeps the job alive while the condition still holds, so
+#    an `always()` job ignores cancellation entirely. That is also why the manual "Cancel workflow"
+#    button appears to do nothing on such a run. `if: always()` makes a job structurally
+#    uncancellable. See
+#    https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation
+#
+# 2. Place it AFTER any artifact upload in the same job. Cancelling tears down the job's remaining
+#    steps, so a cancel step above an upload loses exactly the logs and reports someone needs to
+#    diagnose the failure that triggered it.
+#
+# Requires `actions: write` and `gh` on PATH. Fork PRs get a read-only token, so the cancel is
+# skipped there with a note.
+#
+# EVERY PATH EXITS 0, deliberately. The calling job has already failed; masking that real failure
+# behind a cancellation-plumbing error would be strictly worse than not cancelling.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: gha_cancel_run' >&2
+  exit 2
+fi
+
+run_id="${GITHUB_RUN_ID:-}"
+repo="${GITHUB_REPOSITORY:-}"
+
+if [ -z "$run_id" ] || [ -z "$repo" ]; then
+  printf '%s\n' 'gha_cancel_run: GITHUB_RUN_ID or GITHUB_REPOSITORY is unset; skipping cancel.' >&2
+  exit 0
+fi
+
+# A superseded job also lands here, because gha_stop_if_superseded exits 1. That is benign: a
+# `concurrency` block with cancel-in-progress has usually cancelled the run already, making this a
+# no-op.
+printf 'gha_cancel_run: a required check failed; cancelling run %s to stop the remaining jobs.\n' "$run_id"
+
+if gh run cancel "$run_id" --repo "$repo"; then
+  exit 0
+fi
+
+printf '%s\n' 'gha_cancel_run: cancel request not accepted (read-only token on a fork PR, or the run is already finishing). Continuing.' >&2
+exit 0

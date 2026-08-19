@@ -43,8 +43,11 @@ jobs:
 
       # The suite drives --summary-json, so it needs no Xcode and runs here rather than on a macOS
       # runner. Same parse and same assertions as the .xcresult path.
-      - name: ios_test_result_check regression suite
-        run: tests/ios_test_result_check_test
+      - name: Regression suites for both guards
+        run: |
+          set -eu
+          tests/ios_test_result_check_test
+          tests/android_test_result_check_test
 
   lint:
     name: shellcheck ${{ matrix.shellcheck }}
@@ -84,3 +87,27 @@ jobs:
             exit 1
           }
           "$sc" --shell=sh bin/* tests/*
+
+  android:
+    name: Android instrumentation on an emulator (API ${{ matrix.api-level }})
+    runs-on: ubuntu-24.04
+    # The emulator lane is the expensive one, so it does not start until the cheap jobs are green.
+    # `lint` and `scripts` finish in well under a minute, so listing them costs no wall-clock and
+    # stops an emulator ever booting for a verdict that is already decided.
+    needs: [scripts, lint]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [36]
+    steps:
+      - uses: actions/checkout@v6
+
+      # This is the repo dogfooding its own action. An external consumer writes
+      #   uses: fruitiecutiepie/mobile-ci-kit/.github/actions/android-emulator-test@main
+      # instead of the local path.
+      - name: Run instrumentation tests on an emulator
+        uses: ./.github/actions/android-emulator-test
+        with:
+          working-directory: examples/minimal-android
+          api-level: ${{ matrix.api-level }}

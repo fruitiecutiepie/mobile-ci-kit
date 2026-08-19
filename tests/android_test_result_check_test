@@ -1,0 +1,242 @@
+#!/bin/sh
+# android_test_result_check_test -- regression suite for bin/android_test_result_check.
+#
+# Hermetic: fixtures only, no emulator, no Android SDK, no gradle. The negative cases are
+# unreachable through a real run in CI (you cannot easily make an emulator produce a malformed
+# report on purpose), so they live here.
+#
+# Two fixtures below encode bugs this script actually had, and both are the kind that pass while
+# covering nothing if written carelessly:
+#
+#   * NESTED AGGREGATE. Gradle's report has `<testsuites tests="1">` wrapping `<testsuite tests="1">`.
+#     `<testsuite` is a PREFIX of `<testsuites`, so a substring match conflates them and reports 2
+#     tests for a 1-test run. The fixture uses DIFFERENT numbers in the two elements, so a
+#     double-counting parser cannot accidentally produce the right answer.
+#   * SPACES IN THE FILENAME. Real reports are named `TEST-Pixel_6(AVD) - 16-_app-.xml`. Any
+#     construction that word-splits the file list breaks on the first real device. The fixture uses
+#     a name with spaces AND parentheses.
+#
+# Usage: tests/android_test_result_check_test
+# Exit: 0 all assertions passed, 1 one or more failed.
+set -eu
+
+# `CDPATH=` is a deliberate one-shot prefix assignment for `cd`, not a broken assignment.
+# shellcheck disable=SC1007
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+check="$repo_root/bin/android_test_result_check"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT INT TERM
+
+failures=0
+cases=0
+
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/      /' >&2
+  fi
+}
+
+pass() {
+  cases=$((cases + 1))
+  printf 'ok: %s\n' "$1"
+}
+
+if [ -x "$check" ]; then
+  pass 'bin/android_test_result_check exists and is executable'
+else
+  fail "bin/android_test_result_check is missing or not executable: $check"
+fi
+
+# $1 dir name, $2 tests, $3 skipped, $4 failures, $5 errors, $6 inner-tests (may differ, on purpose)
+# Returns the results dir path.
+report_dir() {
+  d="$scratch/$1/connected"
+  mkdir -p "$d"
+  cat >"$d/TEST-fixture.xml" <<XML
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuites tests="$2" failures="$4" errors="$5" skipped="$3" time="1.0" hostname="localhost">
+  <testsuite name="fixture.Test" tests="$6" failures="0" errors="0" skipped="0" time="1.0">
+    <testcase name="a" classname="fixture.Test" time="1.0" />
+  </testsuite>
+</testsuites>
+XML
+  printf '%s\n' "$d"
+}
+
+check_status=0
+check_output=''
+allow_zero=''
+simulate_ci=''
+
+run_check() {
+  ci_env='GITHUB_ACTIONS= CI='
+  if [ -n "$simulate_ci" ]; then
+    ci_env='GITHUB_ACTIONS=true CI=true'
+  fi
+  set +e
+  # `$ci_env` is unquoted deliberately: it carries two NAME=VALUE words for `env`, and word
+  # splitting is how they are delivered.
+  # shellcheck disable=SC2086
+  if [ -n "$allow_zero" ]; then
+    check_output="$(env $ci_env ANDROID_TEST_ALLOW_ZERO_TESTS=1 "$check" "$@" 2>&1)"
+  else
+    check_output="$(env $ci_env "$check" "$@" 2>&1)"
+  fi
+  check_status=$?
+  set -e
+}
+
+expect_status() {
+  expect_description="$1"
+  expect_code="$2"
+  shift 2
+  run_check "$@"
+  if [ "$check_status" -eq "$expect_code" ]; then
+    pass "$expect_description"
+  else
+    fail "$expect_description (expected exit $expect_code, got $check_status)" "$check_output"
+  fi
+}
+
+# --- Control assertion first: a realistic passing run must actually pass, or every negative case
+# --- below could be satisfied by a script that rejects all input.
+expect_status 'a run that executed a test passes' 0 "$(report_dir ok 1 0 0 0 1)"
+
+# --- The nested-aggregate trap. Inner count is deliberately 7 while the run total is 1: a parser
+# --- that double-counts reports 8, and one that reads only the inner element reports 7. Only reading
+# --- the outer aggregate gives 1.
+expect_status 'the nested per-class element is not added to the run total' 0 \
+  "$(report_dir nested 1 0 0 0 7)"
+if printf '%s' "$check_output" | grep -q 'tests=1 skipped=0'; then
+  pass 'the outer <testsuites> aggregate is read, not the nested <testsuite>'
+else
+  fail 'the run total should come from the outer aggregate only' "$check_output"
+fi
+
+# --- A run with a real failure still RAN: this check must not duplicate the suite's verdict.
+expect_status 'a run whose test failed still counts as having run' 0 "$(report_dir failed 1 0 1 0 1)"
+
+# --- Zero tests declared in an existing report.
+expect_status 'a report declaring zero tests fails' 1 "$(report_dir zero 0 0 0 0 0)"
+if printf '%s' "$check_output" | grep -q 'no test was executed'; then
+  pass 'the zero-test failure says no test was executed'
+else
+  fail 'the zero-test failure should say so' "$check_output"
+fi
+
+# --- All-skipped is distinguished from zero-test, because the remedies differ.
+expect_status 'an all-skipped run fails' 1 "$(report_dir skipped 3 3 0 0 3)"
+if printf '%s' "$check_output" | grep -q 'every test was skipped'; then
+  pass 'the all-skipped failure is distinguished from a zero-test one'
+else
+  fail 'the all-skipped failure should say every test was skipped' "$check_output"
+fi
+
+# --- SPACES AND PARENTHESES in the report filename, which every real device produces.
+spaces_dir="$scratch/spaces/connected/debug"
+mkdir -p "$spaces_dir"
+cat >"$spaces_dir/TEST-Pixel_6(AVD) - 16-_app-.xml" <<'XML'
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuites tests="2" failures="0" errors="0" skipped="0" time="1.0" hostname="localhost">
+  <testsuite name="fixture.Test" tests="2" failures="0" errors="0" skipped="0" time="1.0" />
+</testsuites>
+XML
+expect_status 'a report filename containing spaces and parentheses is read' 0 \
+  "$scratch/spaces/connected"
+if printf '%s' "$check_output" | grep -q '2 test(s) executed'; then
+  pass 'a device-named report file is parsed, not word-split into missing paths'
+else
+  fail 'a filename with spaces should still be read' "$check_output"
+fi
+
+# --- Two devices: totals sum across files rather than last-write-wins.
+multi="$scratch/multi/connected"
+mkdir -p "$multi/dev a" "$multi/dev b"
+for n in a b; do
+  cat >"$multi/dev $n/TEST-device $n.xml" <<'XML'
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuites tests="3" failures="0" errors="0" skipped="1" time="1.0" hostname="localhost">
+  <testsuite name="fixture.Test" tests="3" failures="0" errors="0" skipped="1" time="1.0" />
+</testsuites>
+XML
+done
+expect_status 'totals sum across per-device report files' 0 "$multi"
+if printf '%s' "$check_output" | grep -q 'tests=6 skipped=2'; then
+  pass 'two device reports sum to the run total'
+else
+  fail 'per-device reports should sum, not overwrite' "$check_output"
+fi
+
+# --- Fail closed on anything unreadable, and distinguishably (3, never 1). ---
+missing_attr="$scratch/missing/connected"
+mkdir -p "$missing_attr"
+printf '%s\n' '<testsuites tests="1" failures="0" errors="0" time="1.0"></testsuites>' \
+  >"$missing_attr/TEST-x.xml"
+expect_status 'a report missing an attribute is indeterminate, not a pass' 3 "$missing_attr"
+
+no_elem="$scratch/noelem/connected"
+mkdir -p "$no_elem"
+printf '%s\n' '<something-else />' >"$no_elem/TEST-x.xml"
+expect_status 'a report with no <testsuites> element is indeterminate' 3 "$no_elem"
+
+two_elem="$scratch/twoelem/connected"
+mkdir -p "$two_elem"
+{
+  printf '%s\n' '<testsuites tests="1" failures="0" errors="0" skipped="0"></testsuites>'
+  printf '%s\n' '<testsuites tests="1" failures="0" errors="0" skipped="0"></testsuites>'
+} >"$two_elem/TEST-x.xml"
+expect_status 'two <testsuites> elements in one file is indeterminate, not a guess' 3 "$two_elem"
+
+# --- THE REAL ANDROID FALSE-GREEN: gradle prints BUILD SUCCESSFUL and leaves the directory empty.
+empty="$scratch/empty/connected"
+mkdir -p "$empty"
+expect_status 'an empty results directory is indeterminate, never a pass' 3 "$empty"
+if printf '%s' "$check_output" | grep -q 'no result XML'; then
+  pass 'the empty-directory message names the state gradle leaves behind'
+else
+  fail 'the empty-directory case should explain itself' "$check_output"
+fi
+
+expect_status 'a missing results directory is indeterminate' 3 "$scratch/does-not-exist"
+
+# --- The opt-out relaxes the assertion, not the ability to read a result. ---
+allow_zero=1
+expect_status 'ANDROID_TEST_ALLOW_ZERO_TESTS=1 downgrades a zero-test report to a warning' 0 \
+  "$(report_dir optout 0 0 0 0 0)"
+if printf '%s' "$check_output" | grep -q 'WARNING'; then
+  pass 'the opt-out still warns loudly that nothing was verified'
+else
+  fail 'the opt-out should warn that nothing was verified' "$check_output"
+fi
+
+expect_status 'the opt-out does not suppress a missing directory' 3 "$scratch/does-not-exist"
+expect_status 'the opt-out does not suppress an empty directory' 3 "$empty"
+expect_status 'the opt-out does not suppress a schema change' 3 "$missing_attr"
+expect_status 'the opt-out does not suppress two aggregate elements' 3 "$two_elem"
+
+simulate_ci=1
+expect_status 'the opt-out is refused when CI is set' 1 "$(report_dir optout2 0 0 0 0 0)"
+if printf '%s' "$check_output" | grep -q 'refused in CI'; then
+  pass 'the CI refusal says why it refused'
+else
+  fail 'the CI refusal should name CI as the reason' "$check_output"
+fi
+simulate_ci=''
+allow_zero=''
+
+# --- Control assertion for the flag: the fixture the opt-out just allowed must fail again.
+expect_status 'the same fixture fails again once the opt-out is unset' 1 "$(report_dir optout3 0 0 0 0 0)"
+
+# --- Usage errors are distinct from verdicts. ---
+expect_status 'no argument is a usage error, distinct from a verdict' 2
+expect_status 'an unknown option is a usage error' 2 --nope
+expect_status 'a second positional argument is a usage error' 2 one two
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf 'android_test_result_check_test: %d failure(s) across %d passing assertion(s)\n' "$failures" "$cases" >&2
+  exit 1
+fi
+printf 'android_test_result_check_test: %d assertion(s) passed\n' "$cases"

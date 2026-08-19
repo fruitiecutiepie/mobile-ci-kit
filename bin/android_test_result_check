@@ -1,0 +1,233 @@
+#!/bin/sh
+# android_test_result_check -- fail an Android instrumentation run that executed nothing.
+#
+# `./gradlew :app:connectedDebugAndroidTest` prints `BUILD SUCCESSFUL` and exits 0 when there are
+# no tests to run. Not "0 tests passed" -- it prints no test line at all, and leaves the results
+# directory EMPTY. Verified on a real emulator: deleting the only instrumentation test from the
+# source set turns a passing lane into a green lane that verifies nothing, with no signal anywhere.
+#
+# That is the Android sibling of the iOS zero-test problem (see bin/ios_test_result_check and
+# docs/false-green-tests.md). Same remedy: assert an executed count, separately from the build's own
+# verdict.
+#
+# Usage:
+#   android_test_result_check <results-dir>
+#     e.g. android_test_result_check app/build/outputs/androidTest-results/connected
+#
+# Exit codes, deliberately distinct so a caller can tell the reasons apart:
+#   0  at least one test really executed
+#   1  the run tested nothing -- this gate firing
+#   2  usage error
+#   3  indeterminate: no results directory, no result XML, or a schema this script cannot read.
+#      Fail closed. An unreadable result is not evidence of a passing run, and must not masquerade
+#      as code 1 either, since that is a definite claim about what the run did.
+#
+# `ANDROID_TEST_ALLOW_ZERO_TESTS=1` downgrades code 1 to a loud warning for local runs. It never
+# suppresses code 3, and it is refused when `CI`/`GITHUB_ACTIONS` is set, so a required gate cannot
+# be switched off by one line of workflow YAML.
+#
+# THE PARSING TRAP, and it is the same shape as the iOS one. Gradle's JUnit XML is nested:
+#
+#   <testsuites tests="1" failures="0" skipped="0" ...>     <-- the run total for this file
+#     <testsuite name="...MainActivityTest" tests="1" ...>  <-- one per class
+#
+# Both elements carry a `tests=` attribute, so a whole-text scan for `tests=` DOUBLE COUNTS a
+# one-test run, and `grep -o '<testsuite'` counts two elements because `<testsuites` shares that
+# prefix. This script reads the outer `<testsuites>` aggregate only, requires exactly one per file,
+# and sums across files (one file per device). Anything else fails closed.
+#
+# Requires: POSIX sh and awk. No jq, no Python, no Node.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+label='android-test-result-check'
+
+note() {
+  printf '%s: %s\n' "$label" "$1" >&2
+}
+
+usage() {
+  printf '%s\n' 'Usage: android_test_result_check <results-dir>'
+}
+
+case "${1:-}" in
+  '')
+    usage >&2
+    exit 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    note "unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+results_dir="$1"
+
+if [ ! -d "$results_dir" ]; then
+  note "no results directory at: $results_dir"
+  note 'Nothing proves a test ran. Check the gradle output above for a build or install failure,'
+  # Prose containing backticks, not a command substitution.
+  # shellcheck disable=SC2016
+  note 'and check the path -- it is the `connected` directory, not its `debug` child.'
+  exit 3
+fi
+
+scratch="$(mktemp -d)"
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration.
+# shellcheck disable=SC2329,SC2317
+cleanup() {
+  rm -rf "$scratch"
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# Deliberately NOT `find -name 'TEST-*.xml'` alone: the file name is a Gradle convention, not a
+# contract, and a rename would silently yield zero files and read as "nothing ran". Any .xml in the
+# tree is considered, and a file without exactly one <testsuites> element is a schema failure rather
+# than a skipped file.
+find "$results_dir" -type f -name '*.xml' > "$scratch/files" 2>/dev/null || true
+
+file_count="$(wc -l < "$scratch/files" | tr -d ' ')"
+if [ "$file_count" -eq 0 ]; then
+  note "no result XML under: $results_dir"
+  note 'An instrumentation run that executed nothing leaves this directory empty while gradle still'
+  note 'prints BUILD SUCCESSFUL -- which is exactly the state this check exists to catch. But an'
+  note 'install failure or a wrong path looks identical here, so this is indeterminate, not a'
+  note 'verdict: read the gradle output to tell them apart.'
+  exit 3
+fi
+
+# Read the outer <testsuites> aggregate from ONE file. Prints `OK <tests> <skipped> <failures>
+# <errors>` or `ERR <reason>`.
+#
+# One file per invocation, accumulated by the shell loop below, rather than passing every path to a
+# single awk. Device names contain spaces and parentheses -- a real report is called
+# `TEST-Pixel_6(AVD) - 16-_app-.xml` -- so any construction that word-splits the file list breaks on
+# the first real device. It failed exactly that way while being written.
+file_totals() {
+  awk '
+    function attr(seg, name,   pat, found) {
+      pat = name "=\"[0-9]+\""
+      if (!match(seg, pat)) return ""
+      found = substr(seg, RSTART, RLENGTH)
+      sub(/^.*="/, "", found)
+      sub(/"$/, "", found)
+      return found
+    }
+    {
+      rest = $0
+      # Match the OUTER <testsuites> element only. The delimiter class is load-bearing: `<testsuite`
+      # is a PREFIX of `<testsuites`, so a bare substring match conflates the run aggregate with the
+      # per-class element and double-counts every run.
+      while (match(rest, /<testsuites[ \t>]/)) {
+        seg = substr(rest, RSTART)
+        end_pos = index(seg, ">")
+        if (end_pos > 0) { seg = substr(seg, 1, end_pos) }
+        suites_seen += 1
+        t = attr(seg, "tests");    if (t == "") { print "ERR missing-tests"; exit 0 }
+        s = attr(seg, "skipped");  if (s == "") { print "ERR missing-skipped"; exit 0 }
+        f = attr(seg, "failures"); if (f == "") { print "ERR missing-failures"; exit 0 }
+        e = attr(seg, "errors");   if (e == "") { print "ERR missing-errors"; exit 0 }
+        sum_t += t; sum_s += s; sum_f += f; sum_e += e
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+    }
+    END {
+      # Exactly one aggregate per file. Zero means this is not a report this script understands;
+      # more than one means the schema changed and summing would be a guess.
+      if (suites_seen == 0) { print "ERR no-testsuites-element"; exit 0 }
+      if (suites_seen > 1)  { print "ERR multiple-testsuites-elements"; exit 0 }
+      printf "OK %d %d %d %d\n", sum_t, sum_s, sum_f, sum_e
+    }
+  ' "$1"
+}
+
+total_tests=0
+skipped_tests=0
+failed_tests=0
+error_tests=0
+
+while IFS= read -r report; do
+  [ -n "$report" ] || continue
+  # shellcheck disable=SC2046
+  set -- $(file_totals "$report")
+  case "${1:-}" in
+    OK)
+      total_tests=$((total_tests + $2))
+      skipped_tests=$((skipped_tests + $3))
+      failed_tests=$((failed_tests + $4))
+      error_tests=$((error_tests + $5))
+      ;;
+    ERR)
+      note "could not read the JUnit XML: ${2:-?}"
+      note "in: $report"
+      note 'The report schema changed. Update this script rather than loosening the parse -- a loose'
+      note 'parse would read zero and report a false failure, or worse, a false pass.'
+      exit 3
+      ;;
+    *)
+      note "could not read any totals out of: $report"
+      note 'Neither an OK nor an ERR line came back, so this is not XML this script knows.'
+      exit 3
+      ;;
+  esac
+done < "$scratch/files"
+
+for count_name in tests:"$total_tests" skipped:"$skipped_tests" failures:"$failed_tests" errors:"$error_tests"; do
+  count_value="${count_name#*:}"
+  case "$count_value" in
+    '' | *[!0-9]*)
+      note "\"${count_name%%:*}\" is not a non-negative integer: $count_value"
+      exit 3
+      ;;
+    0) ;;
+    0*)
+      note "\"${count_name%%:*}\" has a leading zero, which shell arithmetic reads as octal: $count_value"
+      exit 3
+      ;;
+  esac
+done
+
+executed_tests=$((total_tests - skipped_tests))
+counts="tests=$total_tests skipped=$skipped_tests failures=$failed_tests errors=$error_tests"
+
+if [ "$total_tests" -gt 0 ] && [ "$executed_tests" -gt 0 ]; then
+  printf '%s: OK (%d test(s) executed; %s)\n' "$label" "$executed_tests" "$counts"
+  exit 0
+fi
+
+if [ "${ANDROID_TEST_ALLOW_ZERO_TESTS:-}" = '1' ]; then
+  if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ]; then
+    note "ANDROID_TEST_ALLOW_ZERO_TESTS=1 is refused in CI ($counts)"
+    note 'The escape hatch is for local and ad-hoc runs. If a CI job genuinely needs a zero-test'
+    note 'invocation, change this script in a reviewed PR and say which job and why.'
+    exit 1
+  fi
+  note "WARNING: no test executed, allowed by ANDROID_TEST_ALLOW_ZERO_TESTS=1 ($counts)"
+  note 'Nothing about this run was verified. Unset that variable to make it a failure again.'
+  exit 0
+fi
+
+if [ "$total_tests" -eq 0 ]; then
+  note "no test was executed at all ($counts)"
+  note 'A report exists but declares zero tests. Usual causes: an -Pandroid.testInstrumentationRunnerArguments'
+  note 'filter that matched nothing, or every test class excluded by an annotation filter.'
+else
+  note "every test was skipped, so nothing was verified ($counts)"
+  note 'A suite that skips itself entirely reports success. Check whether an @Ignore or an assumption'
+  note 'became unconditionally true, or whether this device can run these tests at all.'
+fi
+note 'If a zero-test run is genuinely intended here, set ANDROID_TEST_ALLOW_ZERO_TESTS=1 and say why.'
+exit 1

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Minimal</string>
+    <string name="tap_me">Tap me</string>
+    <string name="not_tapped">not tapped</string>
+    <string name="tapped">tapped</string>
+
+    <!-- These two are the ACCESSIBILITY IDS, and they are the contract this fixture exists to
+         demonstrate. contentDescription on Android and accessibilityIdentifier on iOS both surface
+         to Appium as ~id, so one cross-platform spec can select on them with no platform branching.
+         They are deliberately semantic ("tap-target"), not visual ("blue button"), and deliberately
+         NOT the visible label. A label gets translated and restyled; an accessibility id is a
+         stable contract with the test.
+         (Note: no double hyphen anywhere in this comment. XML forbids it inside comments, and
+         aapt2 rejects the whole resource file with "The string is not permitted within
+         comments".) -->
+    <string name="id_tap_target" translatable="false">tap-target</string>
+    <string name="id_result_text" translatable="false">result-text</string>
+</resources>

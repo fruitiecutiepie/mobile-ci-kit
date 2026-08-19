@@ -23,6 +23,12 @@ Every entry is a real observed failure, not a hypothetical.
 | A test-count parser is correct in dev and wrong in CI | `xcresulttool` summaries are **not flat**: `devicesAndConfigurations[]` repeats the counts per destination. A whole-text scan reads a per-device count as the run total. The first draft was written against an *empty* bundle, where that array is `[]` | parse top-level members only — see the `summary_counts` awk in the script |
 | A required gate goes permanently red one day, for no code change | `--schema-version` was pinned; Apple retired that version, and CI's Xcode auto-upgrades | don't pin it — assert on the count **fields** and fail closed |
 | A required gate was silently switched off | An `ALLOW_ZERO_TESTS`-style env var set in a workflow step, with nothing detecting it | refuse the escape hatch when `CI` is set |
+| `connectedDebugAndroidTest` prints `BUILD SUCCESSFUL` having run nothing | With no tests in the source set it prints **no test line at all** and leaves the results directory **empty**. Verified on a real emulator | [`bin/android_test_result_check`](bin/android_test_result_check) — assert the executed count |
+| An Android test-count parser reports 2 tests for a 1-test run | Gradle's JUnit XML nests `<testsuite>` inside `<testsuites>`, **both carrying `tests=`**, and `<testsuite` is a *prefix* of `<testsuites` | read the outer aggregate only, require exactly one per file, sum across files |
+| A results parser works locally and finds no files in CI | Real report filenames contain spaces and parentheses — `TEST-Pixel_6(AVD) - 16-_app-.xml`. Anything that word-splits the file list breaks on the first real device | iterate with `while IFS= read -r`, never `$(cat list)` |
+| The emulator never finishes booting; the boot timeout expires | The runner user cannot open `/dev/kvm`, so it silently falls back to software rendering. **The symptom looks like a broken AVD** | [emulator action](.github/actions/android-emulator-test/action.yml) — install the KVM udev rule first |
+| The emulator dies ~0.4s after launch, then the job burns its whole timeout | `Not enough space to create userdata partition`. `pixel_6` defaults to ~7.4 GB; the runner has a few GB free. The emulator action then polls for a device that will never appear | free disk **before** boot and set `disk-size: 6144M` |
+| A faster emulator lane quietly stops testing what it exists for | `google_atd` images disable hardware rendering, so anything that renders (WebView, Compose, custom `View`) becomes structurally uncoverable — while still passing | use `google_apis` for any rendering surface |
 | A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
 Full reasoning: **[docs/false-green-tests.md](docs/false-green-tests.md)**.
@@ -60,22 +66,80 @@ suppresses `3`, and it is **refused when `CI`/`GITHUB_ACTIONS` is set**.
 
 ---
 
+## `bin/android_test_result_check`
+
+Fails an Android instrumentation run that executed nothing.
+
+```sh
+./gradlew :app:connectedDebugAndroidTest
+bin/android_test_result_check app/build/outputs/androidTest-results/connected
+```
+
+Same exit-code contract as the iOS guard (`0` ran / `1` gate fired / `2` usage / `3` indeterminate,
+fails closed), and the same `ALLOW_ZERO_TESTS` escape hatch that is refused under CI.
+
+One asymmetry worth knowing: the real Android false-green — no tests in the source set — leaves the
+results directory **empty**, which is indistinguishable from a failed install or a wrong path. So it
+lands on `3` (indeterminate) rather than `1`, and the message says which possibilities to check.
+Either way the lane goes red; the code tells you whether the tool made a claim about your tests.
+
+## `.github/actions/android-emulator-test`
+
+The emulator lane as a composite action, carrying the tuning that makes it boot at all — each setting
+documented with the failure it prevents, and each trade-off with the numbers behind it.
+
+```yaml
+- uses: fruitiecutiepie/mobile-ci-kit/.github/actions/android-emulator-test@main
+  with:
+    working-directory: path/to/your/gradle/project
+```
+
+It boots the emulator, runs your Gradle task, **asserts tests actually executed**, and uploads the
+reports. This repo's own CI runs it against `examples/minimal-android`, so the action has a green run
+behind it rather than a plausible-looking YAML file.
+
+Reasoning, including why the AVD is deliberately **not** cached: **[docs/emulator-in-ci.md](docs/emulator-in-ci.md)**.
+
+## `bin/gha_stop_if_superseded` and `bin/gha_cancel_run`
+
+Stop paying for a verdict that is already decided. `gha_stop_if_superseded` fails fast when a newer
+commit has landed on the branch; `gha_cancel_run` cancels the run from the job that went red.
+
+Two traps encoded in them, both of which cost real debugging time:
+
+* `gha_stop_if_superseded` fetches with `--depth=1` **only when the repo is already shallow**. On a
+  job that paid for `fetch-depth: 0`, an unconditional `--depth=1` writes a new shallow boundary into
+  `.git/shallow` and poisons every later history-dependent git command in the same checkout —
+  `git log` can report the branch tip as *adding* a file that was added years earlier, and
+  `git merge-base` can silently return a wrong answer instead of erroring.
+* `gha_cancel_run` only works if your jobs gate on `!cancelled()`. **`if: always()` makes a job
+  structurally uncancellable** — it ignores this *and* the manual Cancel button. And the cancel step
+  must come after any artifact upload, or you lose the reports explaining the failure that triggered
+  it.
+
+---
+
 ## Tests, and why they are mutation-tested
 
 ```sh
-tests/ios_test_result_check_test    # 46 assertions, no Xcode needed, runs on Linux
+tests/ios_test_result_check_test        # 46 assertions, no Xcode needed
+tests/android_test_result_check_test    # 31 assertions, no emulator/SDK/gradle needed
 ```
 
 A guard that cannot fail reports success exactly like a working one — which is the bug this repo is
 about, one level up. So the suite is checked by mutating the script and confirming it goes red.
 Currently caught:
 
-| Mutation | Caught by |
-| --- | --- |
-| drop `expectedFailures` from the executed sum | `a run of only expected failures counts as having run` |
-| stop distinguishing an all-skipped run | `an all-skipped run fails` |
-| let the opt-out suppress an unparseable count | `the opt-out does not suppress an unparseable count` |
-| stop refusing the opt-out under CI | `the opt-out is refused when CI is set` |
+| Guard | Mutation | Caught by |
+| --- | --- | --- |
+| iOS | drop `expectedFailures` from the executed sum | `a run of only expected failures counts as having run` |
+| iOS | stop distinguishing an all-skipped run | `an all-skipped run fails` |
+| iOS | let the opt-out suppress an unparseable count | `the opt-out does not suppress an unparseable count` |
+| iOS | stop refusing the opt-out under CI | `the opt-out is refused when CI is set` |
+| Android | conflate `<testsuite>` with `<testsuites>` (double count) | 17 assertions, incl. `the outer <testsuites> aggregate is read` |
+| Android | treat an empty results directory as fine | `an empty results directory is indeterminate, never a pass` |
+| Android | count skipped tests as executed | `an all-skipped run fails` |
+| Android | stop refusing the opt-out under CI | `the opt-out is refused when CI is set` |
 
 Three disciplines are baked into the suite, each earned by an assertion that passed while covering
 nothing:
@@ -94,9 +158,12 @@ nothing:
 
 ## Adopting it
 
-**Just the script.** Copy `bin/ios_test_result_check` into your repo, call it after `xcodebuild test`
-with `-resultBundlePath`. No dependencies beyond POSIX `sh`, `awk`, and Xcode 16+. Copy
-`tests/ios_test_result_check_test` too if you want the assertions to keep holding.
+**Just a script.** Every file in `bin/` is standalone — POSIX `sh` and `awk`, no shared library, no
+config. Copy the one you need, and copy its suite from `tests/` if you want the assertions to keep
+holding.
+
+**Just the action.** `uses: fruitiecutiepie/mobile-ci-kit/.github/actions/android-emulator-test@main`
+with a `working-directory`. Nothing else in the kit needs to exist for it.
 
 **Just the reasoning.** `docs/false-green-tests.md` stands alone. If you only change one thing after
 reading it, assert an executed count.
@@ -109,12 +176,13 @@ untested compatibility claim is the kind of thing this repo exists to argue agai
 
 ## Roadmap
 
-Present today: the false-green guard, its suite, and the write-up. Planned, and deliberately **not**
-described here until each has a green CI run behind it:
+Present today, each with a green CI run behind it: both false-green guards, their suites, the
+emulator composite action, the two run-control scripts, and two write-ups. Planned, and deliberately
+**not** described above until the same is true of them:
 
-- A composite action for Android instrumentation tests on an emulator, carrying the measured tuning
-  (KVM permissions, disk reclaim before boot, why the AVD is *not* cached).
 - A WebdriverIO + Appium harness against local emulators/simulators, with the provider boundary kept
   thin enough that a device farm is a config change rather than a migration.
-- The portable subset of a larger CI trap index (`if: always()` making a job uncancellable; a new
-  gate being advisory-only until wired into two places; `awk` being mawk on Ubuntu).
+- The same for an iOS simulator, and one shared spec running unchanged on both platforms — which is
+  what the matching accessibility ids in `examples/minimal-android` exist for.
+- The portable subset of a larger CI trap index (a new gate being advisory-only until wired into two
+  places; `awk` being mawk on Ubuntu; POSIX `sh` having no `pipefail`).

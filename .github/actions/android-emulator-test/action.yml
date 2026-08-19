@@ -1,0 +1,153 @@
+name: Android instrumentation tests on an emulator
+description: >-
+  Boot an Android emulator on a standard GitHub-hosted Linux runner, run instrumentation tests, and
+  assert that tests actually executed. Carries the runner-specific tuning that an emulator needs in
+  order to boot at all, each setting documented with the failure it prevents.
+
+inputs:
+  working-directory:
+    description: Directory containing the Gradle project (where ./gradlew lives).
+    required: true
+  gradle-task:
+    description: Gradle task that runs the instrumentation tests.
+    required: false
+    default: ":app:connectedDebugAndroidTest"
+  results-dir:
+    description: >-
+      Instrumentation results directory, relative to working-directory. This is the `connected`
+      directory, not its per-build-type child.
+    required: false
+    default: "app/build/outputs/androidTest-results/connected"
+  api-level:
+    description: Android API level for the AVD.
+    required: false
+    default: "36"
+  target:
+    description: >-
+      System image target. Defaults to google_apis rather than the faster google_atd on purpose:
+      ATD images disable hardware rendering, which makes the lane structurally unable to cover
+      anything that renders (a WebView, a Compose surface, a custom View).
+    required: false
+    default: "google_apis"
+  arch:
+    description: System image architecture.
+    required: false
+    default: "x86_64"
+  profile:
+    description: Device profile for the AVD.
+    required: false
+    default: "pixel_6"
+  disk-size:
+    description: >-
+      Userdata partition size. pixel_6 defaults to about 7.4 GB, which overruns the runner disk and
+      kills the emulator ~0.4s after launch. 6 GB boots API 36 with room for both APKs.
+    required: false
+    default: "6144M"
+  emulator-options:
+    description: Raw emulator flags.
+    required: false
+    default: "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back emulated -no-metrics"
+  java-version:
+    description: JDK version for the Gradle build.
+    required: false
+    default: "17"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java-version }}
+
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v5
+
+    # Hardware-accelerated virtualisation IS available on standard 2-vCPU GitHub-hosted Linux
+    # runners, but the runner user has no access to /dev/kvm until this rule is installed. Without
+    # it the emulator falls back to software rendering and effectively never finishes booting -- the
+    # symptom is the boot timeout expiring, which reads like a broken AVD rather than a permissions
+    # problem.
+    - name: Enable KVM group permissions
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    # The runner has only a few GB free once the SDK, system image and Gradle caches are in place,
+    # and the emulator needs a multi-GB userdata partition or it dies instantly with "Not enough
+    # space to create userdata partition" -- and the emulator action then burns its entire boot
+    # timeout polling for a device that will never appear. Reclaim large preinstalled toolchains
+    # this lane does not use. Deliberately does NOT touch the Android SDK or the JDK.
+    - name: Free disk space for the emulator
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf 'Before:\n'; df -h /home/runner | tail -n 1
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/share/swift \
+          /usr/local/share/powershell \
+          /usr/local/lib/heroku \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /opt/google/chrome
+        printf 'After:\n'; df -h /home/runner | tail -n 1
+
+    # The AVD is deliberately NOT cached. See docs/emulator-in-ci.md for the numbers: a cache entry
+    # is ~2.1 GB against a 10 GB per-repository limit, GitHub scopes PR caches so no other PR can
+    # read one written by a PR-only workflow, and it would evict the Gradle caches that do amortise
+    # across every job -- to save about 3 minutes only on a second push to the same PR. Creating the
+    # AVD fresh keeps the cost predictable.
+    - name: Run instrumentation tests
+      uses: reactivecircus/android-emulator-runner@v2.38.0
+      with:
+        api-level: ${{ inputs.api-level }}
+        target: ${{ inputs.target }}
+        arch: ${{ inputs.arch }}
+        profile: ${{ inputs.profile }}
+        disk-size: ${{ inputs.disk-size }}
+        disable-animations: true
+        emulator-options: ${{ inputs.emulator-options }}
+        working-directory: ${{ inputs.working-directory }}
+        script: ./gradlew --no-daemon ${{ inputs.gradle-task }}
+
+    # THE POINT OF THIS ACTION. `connectedDebugAndroidTest` prints BUILD SUCCESSFUL and exits 0 when
+    # there are no tests to run, leaving the results directory empty -- verified on a real emulator.
+    # Without this step the lane is green and verifies nothing, which is worse than not having it.
+    #
+    # `if: always()` is deliberately NOT used here: it would make this step run after a cancellation
+    # and, more importantly, `always()` on a job makes that job structurally uncancellable. `!
+    # cancelled()` is the correct spelling of "run even if the previous step failed".
+    - name: Assert tests actually executed
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        # `github.action_path` points at this action's directory inside the checked-out kit, so the
+        # guard is found whether the kit IS the repo or is being consumed from another one.
+        CHECK: ${{ github.action_path }}/../../../bin/android_test_result_check
+      run: |
+        set -euo pipefail
+        if [ ! -x "$CHECK" ]; then
+          printf 'error: guard not found or not executable at %s\n' "$CHECK" >&2
+          exit 1
+        fi
+        "$CHECK" '${{ inputs.results-dir }}'
+
+    # Deliberately AFTER the assertion, and using `!cancelled()` rather than `failure()`, so the
+    # reports are uploaded whether the gradle run failed, the guard fired, or both.
+    - name: Upload instrumentation reports
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: android-instrumentation-reports-api${{ inputs.api-level }}
+        path: |
+          ${{ inputs.working-directory }}/app/build/reports/androidTests/
+          ${{ inputs.working-directory }}/app/build/outputs/androidTest-results/
+        if-no-files-found: ignore
+        retention-days: 7
