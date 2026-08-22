@@ -57,6 +57,34 @@ until measurement showed `checkbashisms` **misses** `set -o pipefail` entirely a
 bashism probes, caught nothing shellcheck did not — so the extra dependency was dropped rather than
 added for the appearance of coverage.
 
+### A test harness that dies halfway reports success on macOS — **measured**
+
+`/bin/sh` on macOS is **bash 3.2**, where an `EXIT` trap sees `$? == 0` after a `set -u` or `set -e`
+abort. So a harness with the usual cleanup trap
+
+```sh
+trap 'rm -rf "$scratch"' EXIT INT TERM
+```
+
+exits **0** when it dies halfway through — reporting success for a run that executed a fraction of its
+assertions. Measured: bash 3.2 → `0`; bash 5 → `1`; zsh → `1`. Linux `sh` (dash) propagates correctly,
+so **this is a local-only false green**, which is worse than a CI one: it is where you do your
+iterating, and CI never contradicts you.
+
+Preserving `$?` in the trap does **not** fix it, because the value is already `0` by then. A
+completion sentinel does:
+
+```sh
+completed=''
+trap 'rc=$?; rm -rf "$scratch"; [ -n "$completed" ] || rc=1; exit "$rc"' EXIT INT TERM
+...
+completed=1   # immediately before the summary
+```
+
+All four suites in this repo had the flaw and now carry the sentinel; each was verified by injecting a
+mid-script abort and confirming a non-zero exit, against a control still using the old trap that
+exits 0.
+
 ### An unpinned linter is a reproducibility hole — **measured**
 
 Different versions emit **different check IDs for the same code**, so a `# shellcheck disable=`

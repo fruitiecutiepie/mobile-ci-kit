@@ -1,0 +1,240 @@
+#!/bin/sh
+# ios_target_membership_check_test -- regression suite for bin/ios_target_membership_check.
+#
+# Hermetic: synthetic project files and scratch source trees. No Xcode.
+#
+# THE LOAD-BEARING FIXTURE is the "navigator-only" file: present as a PBXFileReference, absent from
+# any Sources build phase. That is what a file added to the project but not to a target looks like,
+# it APPEARS IN XCODE so it reads as included, and a `grep '<name>' project.pbxproj` finds it and
+# reports a clean pass. Any fixture set without that case lets a naive filename match pass everything.
+set -eu
+
+# `CDPATH=` is a deliberate one-shot prefix assignment for `cd`, not a broken assignment.
+# shellcheck disable=SC1007
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+check="$repo_root/bin/ios_target_membership_check"
+scratch="$(mktemp -d)"
+# A COMPLETION SENTINEL, not decoration. macOS's /bin/sh is bash 3.2, where an EXIT trap sees
+# `$? == 0` after a `set -u`/`set -e` abort -- so a harness that dies halfway through exits **0** and
+# reports success. Verified: bash 3.2 gives 0, bash 5 and zsh give 1. A test harness that can die
+# silently is this repo's own subject turned inward, so the trap forces a failure unless the script
+# reached its last line.
+completed=''
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration.
+# shellcheck disable=SC2329,SC2317
+finish() {
+  rc=$?
+  rm -rf "$scratch"
+  # An abort leaves `completed` empty, and macOS bash 3.2 hands the trap $?=0 in that case, so the
+  # sentinel is what turns a half-run suite into a failure.
+  [ -n "$completed" ] || rc=1
+  exit "$rc"
+}
+trap finish EXIT INT TERM
+
+failures=0
+cases=0
+
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/      /' >&2
+  fi
+}
+
+pass() {
+  cases=$((cases + 1))
+  printf 'ok: %s\n' "$1"
+}
+
+if [ -x "$check" ]; then
+  pass 'bin/ios_target_membership_check exists and is executable'
+else
+  fail "bin/ios_target_membership_check is missing or not executable: $check"
+fi
+
+check_status=0
+check_output=''
+
+expect_status() {
+  description="$1"
+  expect_code="$2"
+  shift 2
+  set +e
+  check_output="$("$check" "$@" 2>&1)"
+  check_status=$?
+  set -e
+  if [ "$check_status" -eq "$expect_code" ]; then
+    pass "$description"
+  else
+    fail "$description (expected exit $expect_code, got $check_status)" "$check_output"
+  fi
+}
+
+# Build a scratch case: $1 = name, then one or more specs as ARGUMENTS:
+#   compiled:<file>  in a Sources build phase
+#   navonly:<file>   PBXFileReference only -- visible in Xcode, never compiled
+#   ondisk:<file>    on disk, absent from the project entirely
+#
+# Sets `case_proj` and `case_src`. Specs are arguments rather than stdin ON PURPOSE: piping into the
+# function would run it in a SUBSHELL and silently discard both globals -- the same trap as a
+# `while read` loop on the right of a pipe. An earlier version of this suite did exactly that and
+# wrote to `/NOTES.md`.
+case_proj=''
+case_src=''
+make_case() {
+  name="$1"
+  d="$scratch/$name"
+  mkdir -p "$d/src"
+  proj="$d/project.pbxproj"
+  shift
+  refs=""
+  sources=""
+  for spec in "$@"; do
+    [ -n "$spec" ] || continue
+    kind="${spec%%:*}"
+    f="${spec#*:}"
+    mkdir -p "$d/src/$(dirname "$f")" 2>/dev/null || true
+    printf '// %s\n' "$f" > "$d/src/$f"
+    b="${f##*/}"
+    case "$kind" in
+      compiled)
+        refs="$refs\t\tREF$b /* $b */ = {isa = PBXFileReference; path = $b; };\n"
+        sources="$sources\t\t\t\tBLD$b /* $b in Sources */,\n"
+        ;;
+      navonly)
+        # PBXFileReference only: visible in Xcode, never compiled.
+        refs="$refs\t\tREF$b /* $b */ = {isa = PBXFileReference; path = $b; };\n"
+        ;;
+      ondisk) : ;;  # not mentioned in the project at all
+    esac
+  done
+  {
+    printf '// !$*UTF8*$!\n{\n'
+    printf '/* Begin PBXFileReference section */\n'
+    printf '%b' "$refs"
+    printf '/* End PBXFileReference section */\n'
+    printf '/* Begin PBXSourcesBuildPhase section */\n'
+    printf '\t\tPHASE /* Sources */ = {\n\t\t\tisa = PBXSourcesBuildPhase;\n\t\t\tfiles = (\n'
+    printf '%b' "$sources"
+    printf '\t\t\t);\n\t\t};\n'
+    printf '/* End PBXSourcesBuildPhase section */\n}\n'
+  } > "$proj"
+  case_proj="$proj"
+  case_src="$d/src"
+}
+
+# --- Control assertion: an all-compiled project must pass, or every negative case below could be
+# --- satisfied by a script that rejects all input.
+make_case all_good compiled:App.swift compiled:Helper.swift
+expect_status 'a project where every file is compiled passes' 0 "$case_proj" "$case_src"
+if printf '%s' "$check_output" | grep -q '2 source file(s)'; then
+  pass 'the passing message reports how many files it checked'
+else
+  fail 'the pass should report the file count' "$check_output"
+fi
+
+# --- THE MONTH-LONG BUG, form 1: on disk, never added to the project.
+make_case never_added compiled:App.swift ondisk:Forgotten.swift
+expect_status 'a file on disk but absent from the project fails' 1 "$case_proj" "$case_src"
+if printf '%s' "$check_output" | grep -q 'Forgotten.swift'; then
+  pass 'the failure names the uncompiled file'
+else
+  fail 'the failure should name the file' "$check_output"
+fi
+
+# --- THE MONTH-LONG BUG, form 2 and the subtle one: a PBXFileReference with no Sources entry. This
+# --- file APPEARS IN XCODE, and a bare filename grep finds it -- so this case is what separates a
+# --- real check from a decorative one.
+make_case nav_only compiled:App.swift navonly:NavOnly.swift
+proj="$case_proj"
+if grep -q 'NavOnly.swift' "$proj"; then
+  pass 'the navigator-only fixture DOES contain the bare filename (so a naive grep would pass)'
+else
+  fail 'fixture is wrong: the navigator-only file should appear in the project text'
+fi
+if grep -qF 'NavOnly.swift in Sources */' "$proj"; then
+  fail 'fixture is wrong: the navigator-only file must NOT have a Sources marker'
+else
+  pass 'the navigator-only fixture has no Sources marker'
+fi
+expect_status 'a file in the project but not in a Sources phase fails' 1 "$case_proj" "$case_src"
+if printf '%s' "$check_output" | grep -q 'NavOnly.swift'; then
+  pass 'the navigator-only file is reported, despite appearing in the project'
+else
+  fail 'the navigator-only file should be reported' "$check_output"
+fi
+
+# --- Non-source files must be ignored, or every project with a README in src/ goes red.
+make_case ignores_other compiled:App.swift
+printf 'readme\n' > "$case_src/NOTES.md"
+printf 'plist\n' > "$case_src/Info.plist"
+expect_status 'non-source files on disk are ignored' 0 "$case_proj" "$case_src"
+
+# --- Objective-C and C++ sources belong in a Sources phase too.
+make_case other_langs compiled:Bridge.m compiled:Fast.mm compiled:Legacy.c
+expect_status 'objc and c++ sources are checked as well as swift' 0 "$case_proj" "$case_src"
+make_case objc_missing compiled:App.swift ondisk:Bridge.m
+expect_status 'an uncompiled .m is caught, not just .swift' 1 "$case_proj" "$case_src"
+
+# --- Fail closed on shapes it cannot evaluate. ---
+expect_status 'a missing project file is indeterminate' 3 "$scratch/nope.pbxproj" "$scratch"
+
+make_case bad_dir compiled:App.swift
+expect_status 'a nonexistent source directory is indeterminate' 3 "$case_proj" "$scratch/no-such-dir"
+
+# An empty search is NOT a pass: a wrong path and a deleted source set both land here.
+mkdir -p "$scratch/empty_src"
+make_case empty_case compiled:App.swift
+expect_status 'finding zero source files is indeterminate, never a pass' 3 "$case_proj" "$scratch/empty_src"
+if printf '%s' "$check_output" | grep -q 'nothing was verified'; then
+  pass 'the zero-files message says nothing was verified'
+else
+  fail 'the zero-files case should say nothing was verified' "$check_output"
+fi
+
+# Duplicate basenames make a name-based verdict unsound.
+make_case dupes compiled:Helpers.swift compiled:sub/Helpers.swift
+expect_status 'duplicate basenames are indeterminate, not a guess' 3 "$case_proj" "$case_src"
+if printf '%s' "$check_output" | grep -q 'duplicate basenames'; then
+  pass 'the duplicate-basename message explains why a name match is unsound'
+else
+  fail 'the duplicate case should explain itself' "$check_output"
+fi
+
+# A project with no Sources markers at all cannot be evaluated by this method.
+nomark="$scratch/nomark"
+mkdir -p "$nomark/src"
+printf '// x\n' > "$nomark/src/App.swift"
+printf '{\n/* Begin PBXFileReference section */\n/* End PBXFileReference section */\n}\n' > "$nomark/project.pbxproj"
+expect_status 'a project with no Sources markers is indeterminate' 3 "$nomark/project.pbxproj" "$nomark/src"
+
+# Xcode 16+ synchronized groups: membership is directory-derived and can carry exceptions, so
+# neither a pass nor a failure can be claimed.
+sync="$scratch/sync"
+mkdir -p "$sync/src"
+printf '// x\n' > "$sync/src/App.swift"
+printf '{\nPBXFileSystemSynchronizedRootGroup\nApp.swift in Sources */\n}\n' > "$sync/project.pbxproj"
+expect_status 'a filesystem-synchronized project is indeterminate' 3 "$sync/project.pbxproj" "$sync/src"
+if printf '%s' "$check_output" | grep -q 'synchronized'; then
+  pass 'the synchronized-group message names the mechanism'
+else
+  fail 'the synchronized-group case should name the mechanism' "$check_output"
+fi
+
+# --- Usage errors are distinct from verdicts. ---
+expect_status 'no argument is a usage error' 2
+expect_status 'an unknown option is a usage error' 2 --nope
+make_case usage_case compiled:App.swift
+expect_status 'a project with no source directory is a usage error' 2 "$case_proj"
+
+completed=1
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf 'ios_target_membership_check_test: %d failure(s) across %d passing assertion(s)\n' "$failures" "$cases" >&2
+  exit 1
+fi
+printf 'ios_target_membership_check_test: %d assertion(s) passed\n' "$cases"

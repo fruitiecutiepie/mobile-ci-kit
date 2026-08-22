@@ -33,6 +33,13 @@ inputs:
       to rule out and minutes to discover from a build. Leave empty to skip that check.
     required: false
     default: ""
+  source-dirs:
+    description: >-
+      Space-separated source directories, relative to working-directory. When set, every source file
+      found in them is asserted to be in a Sources build phase -- catching a file that exists, was
+      reviewed, and is not compiled. Requires `project`. Leave empty to skip.
+    required: false
+    default: ""
   xcodegen-spec:
     description: >-
       If set, run `xcodegen generate` with this spec before building. For projects whose .xcodeproj is
@@ -71,6 +78,26 @@ runs:
           exit 1
         fi
         "$CHECK" '${{ inputs.scheme-path }}'
+
+    # Also before the build, and for the same reason: a file that is not in a Sources phase is a
+    # static fact. This is the one false-green mechanism neither other guard can see -- the scheme is
+    # valid, and the executed count is non-zero because the OTHER tests ran.
+    - name: Assert every source file is compiled
+      if: ${{ inputs.source-dirs != '' && inputs.project != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CHECK: ${{ github.action_path }}/../../../bin/ios_target_membership_check
+      run: |
+        set -euo pipefail
+        if [ ! -x "$CHECK" ]; then
+          printf 'error: guard not found or not executable at %s\n' "$CHECK" >&2
+          exit 1
+        fi
+        # Deliberately unquoted: source-dirs is a space-separated list and word splitting is how the
+        # arguments are delivered.
+        # shellcheck disable=SC2086
+        "$CHECK" '${{ inputs.project }}/project.pbxproj' ${{ inputs.source-dirs }}
 
     # Boot the simulator via the shared script rather than inline `simctl`, so the prep is readable,
     # copyable and exercised the same way the Android side is. It also prints what the image actually

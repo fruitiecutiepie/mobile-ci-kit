@@ -47,6 +47,7 @@ jobs:
         run: |
           set -eu
           tests/ios_scheme_check_test
+          tests/ios_target_membership_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
 
@@ -144,6 +145,7 @@ jobs:
           }
 
           tests/ios_scheme_check_test
+          tests/ios_target_membership_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
 
@@ -314,6 +316,7 @@ jobs:
           scheme: Minimal
           # xcodegen writes the shared scheme here, so it exists by the time the check runs.
           scheme-path: Minimal.xcodeproj/xcshareddata/xcschemes/Minimal.xcscheme
+          source-dirs: Sources Tests
           # macos-15 images ship iPhone 16-era simulators; the prep script prints what is actually
           # available when the name is wrong, so a bad name is one log line away from the right one.
           simulator: iPhone 16

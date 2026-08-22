@@ -1,0 +1,190 @@
+#!/bin/sh
+# ios_target_membership_check -- assert every source file on disk is actually compiled.
+#
+# A .swift file can sit in the right directory, pass code review, and never be built. It is not in any
+# target's Sources build phase, so `xcodebuild` never compiles it and never runs its tests. Observed
+# for real: a Swift test file stayed green for A MONTH this way -- no gate noticed, because there is
+# nothing to notice. A test that is not compiled cannot fail.
+#
+# This is the third false-green mechanism on iOS, and the only one neither of the other guards can
+# see. `bin/ios_scheme_check` reads the scheme, which is valid. `bin/ios_test_result_check` reads the
+# executed count, which is non-zero because the OTHER tests ran. Nothing anywhere says "this file you
+# wrote is not part of the build".
+#
+# Usage:
+#   ios_target_membership_check <project.pbxproj> <source-dir> [<source-dir>...]
+#
+# Checks these extensions, being the ones that belong in a Sources phase:
+#   .swift .m .mm .c .cc .cpp
+#
+# Exit codes, matching this repo's other guards:
+#   0  every source file found on disk is in a Sources build phase
+#   1  the gate firing -- at least one file on disk is not compiled
+#   2  usage error
+#   3  indeterminate: unreadable project, a project shape this check cannot evaluate, or ambiguous
+#      basenames. Fail closed -- "I cannot tell" must not read as "all good".
+#
+# HOW IT DISCRIMINATES, and why the obvious check is wrong. A `project.pbxproj` mentions a file in up
+# to three places:
+#
+#   PBXBuildFile      ... /* Foo.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABC /* Foo.swift */; };
+#   PBXFileReference  ABC /* Foo.swift */ = {isa = PBXFileReference; path = Foo.swift; ...};
+#   Sources phase     ... /* Foo.swift in Sources */,
+#
+# A file added to the project but NOT to a target has the PBXFileReference and no PBXBuildFile -- so
+# it APPEARS IN XCODE'S NAVIGATOR and looks included, and a `grep 'Foo.swift' project.pbxproj` finds
+# it and reports a clean pass. That is the failure this guard exists to catch, so matching on the
+# bare filename would miss precisely the case that matters. The marker used instead is
+# `/* <name> in Sources */`, which only appears for a file that reaches a Sources build phase.
+#
+# TWO SHAPES THIS CHECK REFUSES TO GUESS AT, both exiting 3:
+#
+#   * FILESYSTEM-SYNCHRONIZED GROUPS (Xcode 16+, `PBXFileSystemSynchronizedRootGroup`). Membership is
+#     derived from the directory, so individual files are not listed and every file would look
+#     missing. Worse, such groups can still exclude files via a
+#     `PBXFileSystemSynchronizedBuildFileExceptionSet`, which this check cannot evaluate -- so it
+#     cannot honestly report a pass either. If your project uses them, do not wire this check.
+#   * DUPLICATE BASENAMES. Two files named `Helpers.swift` in different directories are
+#     indistinguishable by name, so if one is compiled and the other is not, a name-based check
+#     passes wrongly. Reported rather than silently tolerated.
+#
+# Requires POSIX sh, awk and find. No Ruby, no Python, no Xcode.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+label='ios-target-membership-check'
+
+note() {
+  printf '%s: %s\n' "$label" "$1" >&2
+}
+
+usage() {
+  printf '%s\n' 'Usage: ios_target_membership_check <project.pbxproj> <source-dir> [<source-dir>...]'
+}
+
+case "${1:-}" in
+  '')
+    usage >&2
+    exit 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    note "unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+esac
+
+pbxproj="$1"
+shift
+
+if [ "$#" -eq 0 ]; then
+  note 'no source directory given; there would be nothing to check'
+  usage >&2
+  exit 2
+fi
+
+if [ ! -f "$pbxproj" ] || [ ! -r "$pbxproj" ]; then
+  note "cannot read project file: $pbxproj"
+  note 'Expected <project>.xcodeproj/project.pbxproj'
+  exit 3
+fi
+
+# Xcode 16+ synchronized groups: membership is directory-derived, so per-file assertions are
+# meaningless here, and exception sets mean a pass cannot be claimed either.
+if grep -q 'PBXFileSystemSynchronizedRootGroup' "$pbxproj" 2>/dev/null; then
+  note 'this project uses filesystem-synchronized groups (Xcode 16+)'
+  note 'Membership is derived from the directory rather than listed per file, so this check cannot'
+  note 'verify it -- and such groups can still EXCLUDE files via a'
+  note 'PBXFileSystemSynchronizedBuildFileExceptionSet, so a pass cannot be claimed either.'
+  note 'Do not wire this check for such a project; assert on the built binary instead.'
+  exit 3
+fi
+
+scratch="$(mktemp -d)"
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration.
+# shellcheck disable=SC2329,SC2317
+cleanup() {
+  rm -rf "$scratch"
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# The marker convention must actually be in use, or every file would look missing. Xcode and xcodegen
+# both write these comments; a generator that omits them would make this check meaningless, so that
+# is detected rather than reported as 64 missing files.
+if ! grep -q ' in Sources \*/' "$pbxproj" 2>/dev/null; then
+  # Prose containing backticks, not a command substitution.
+  # shellcheck disable=SC2016
+  note 'no `/* ... in Sources */` markers found in the project file'
+  note 'This check reads those comments to tell a compiled file from one that is merely present in'
+  note 'the project. Without them it cannot distinguish the two, and would report every file as'
+  note 'missing. Either the project has no source build phase at all, or it was written by a tool'
+  note 'that omits the comments -- both are outside what this check can evaluate.'
+  exit 3
+fi
+
+# Collect source files on disk.
+: > "$scratch/disk"
+for dir in "$@"; do
+  if [ ! -d "$dir" ]; then
+    note "no such source directory: $dir"
+    exit 3
+  fi
+  find "$dir" -type f \
+    \( -name '*.swift' -o -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) \
+    >> "$scratch/disk" 2>/dev/null || true
+done
+
+file_count="$(wc -l < "$scratch/disk" | tr -d ' ')"
+if [ "$file_count" -eq 0 ]; then
+  # An empty search is not a pass. A wrong path, or a source set that was deleted wholesale, both
+  # land here -- and reporting "all files are compiled" for zero files is the exact fail-open shape
+  # this repo exists to argue against.
+  note "found no source files under: $*"
+  note 'Nothing to check means nothing was verified. Check the path, and check whether the source'
+  note 'set still exists.'
+  exit 3
+fi
+
+# Ambiguous basenames make a name-based verdict unsound.
+awk -F/ '{ print $NF }' "$scratch/disk" | sort > "$scratch/names"
+dupes="$(uniq -d < "$scratch/names")"
+if [ -n "$dupes" ]; then
+  note 'duplicate basenames on disk, so a name-based membership check cannot be trusted:'
+  printf '%s\n' "$dupes" | sed "s/^/$label:   /" >&2
+  note 'If one copy is compiled and the other is not, a name match passes wrongly. Rename them, or'
+  note 'check membership per target with a tool that reads the full project graph.'
+  exit 3
+fi
+
+missing=0
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  base="${path##*/}"
+  # Fixed-string match on the exact marker. `grep -F` so a basename containing regex metacharacters
+  # (rare but legal) cannot alter the pattern.
+  if ! grep -qF " $base in Sources */" "$pbxproj"; then
+    if [ "$missing" -eq 0 ]; then
+      note 'these files exist on disk but are NOT in any Sources build phase:'
+    fi
+    printf '%s:   %s\n' "$label" "$path" >&2
+    missing=$((missing + 1))
+  fi
+done < "$scratch/disk"
+
+if [ "$missing" -gt 0 ]; then
+  note "$missing of $file_count source file(s) are not compiled"
+  note 'They are not built, so any test in them cannot fail and any code in them cannot ship.'
+  note 'A file can be present in the project navigator and still not belong to a target -- that is'
+  note 'the usual cause, and it is why this looks fine in Xcode. Add it to the target: select the'
+  note 'file, File inspector > Target Membership.'
+  exit 1
+fi
+
+printf '%s: OK (%d source file(s), all in a Sources build phase)\n' "$label" "$file_count"

@@ -27,7 +27,8 @@ Every entry is a real observed failure, not a hypothetical.
 | Symptom | Actual cause | Guard |
 | --- | --- | --- |
 | `xcodebuild test` prints a suite tree where every line says `passed`, and `Executed 0 tests` | Test host crashed on launch; XCTest restarted it with nothing left to run. No `** TEST FAILED **` is printed, and the word `crash` never appears | [`bin/ios_test_result_check`](bin/ios_test_result_check) — assert the executed count |
-| iOS suite green for a month, one test file never ran | The `.swift` file was on disk and reviewed, but absent from the Xcode target in `project.pbxproj` | [docs](docs/false-green-tests.md#before-the-run--assert-on-the-scheme) — assert disk files vs target |
+| iOS suite green for a month, one test file never ran | The `.swift` file was on disk and reviewed, but absent from the Xcode target in `project.pbxproj`. A test that is not compiled cannot fail | [`bin/ios_target_membership_check`](bin/ios_target_membership_check) — assert disk files are in a Sources phase |
+| A target-membership check passes on the very file it should catch | A file added to the project but not a target has a `PBXFileReference` and no `PBXBuildFile` — it **shows in Xcode**, and a bare-filename grep finds it | match `/* <name> in Sources */`, not the filename |
 | iOS suite green, zero tests run, scheme looks fine in Xcode | Shared scheme lost its `<TestableReference>`, or has one marked `skipped = "YES"` | [`bin/ios_scheme_check`](bin/ios_scheme_check) — assert the scheme *before* building |
 | A scheme check passes on every scheme, including broken ones | Xcode writes attributes on their **own lines**, so `grep 'TestableReference.*skipped'` matches nothing on a real scheme and reports a clean pass on a file it never parsed | track the open tag to its `>`; tolerate `skipped = "YES"` spacing |
 | CI boots a different simulator than you named | A prefix match silently selects `iPhone 16 Pro` when you asked for `iPhone 16`, so you test a device you did not choose | [`bin/gha_prepare_ios_simulator`](bin/gha_prepare_ios_simulator) — exact-name match, and it prints what the image ships |
@@ -44,6 +45,7 @@ Every entry is a real observed failure, not a hypothetical.
 | A faster emulator lane quietly stops testing what it exists for | `google_atd` images disable hardware rendering, so anything that renders (WebView, Compose, custom `View`) becomes structurally uncoverable — while still passing | use `google_apis` for any rendering surface |
 | Switching device farms means editing every test | The farm's uploaded-app handle, vendor capability namespace, or device names leaked into specs | [provider boundary](e2e/providers/provider.ts) — three methods; assert it with a grep in CI |
 | A device class silently resolves to nothing on one farm | Nothing forced each provider to handle every class | [contract test](e2e/support/provider.contract.test.ts) — assert every class on every platform |
+| A test harness dies halfway through and reports success | macOS `/bin/sh` is bash 3.2, where an `EXIT` trap sees `$?==0` after a `set -u` abort. Local-only, so CI never contradicts you | a completion sentinel — [docs](docs/ci-traps.md) |
 | A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
 | A check script works on your Mac and misbehaves on the runner | Ubuntu's `/usr/bin/awk` is **mawk**, macOS ships BSD awk. mawk's `{n,m}` interval quantifiers cannot be relied on, and the failure can be a silent "matched nothing" | [`ci.yml`](.github/workflows/ci.yml) — run the suites under **both** mawk and gawk, and assert the shim took effect |
@@ -105,6 +107,22 @@ It covers the two *static* causes of a zero-test iOS run — no `<TestableRefere
 **Use it together with `ios_test_result_check`, not instead of it.** They fail at different times: a
 valid scheme proves nothing about runtime, and an executed count cannot tell you the scheme was wrong
 before you spent ten minutes finding out.
+
+## `bin/ios_target_membership_check`
+
+Asserts every source file on disk is actually compiled.
+
+```sh
+bin/ios_target_membership_check App.xcodeproj/project.pbxproj Sources Tests
+```
+
+This is the third iOS false-green mechanism and the only one the other two guards **cannot** see —
+the scheme is valid, and the executed count is non-zero because the other tests ran.
+
+It matches `/* <name> in Sources */` rather than the bare filename, because a file added to the
+project but not to a target has a `PBXFileReference` and no `PBXBuildFile`: it appears in Xcode's
+navigator and a filename grep finds it. Two shapes exit `3` rather than guessing —
+filesystem-synchronized groups (Xcode 16+) and duplicate basenames.
 
 ## `bin/android_test_result_check`
 
@@ -214,6 +232,7 @@ for vendor strings and platform branching, so the boundary is asserted rather th
 
 ```sh
 tests/ios_scheme_check_test             # 20 assertions, fixtures only
+tests/ios_target_membership_check_test  # 24 assertions, fixtures only
 tests/ios_test_result_check_test        # 46 assertions, no Xcode needed
 tests/android_test_result_check_test    # 31 assertions, no emulator/SDK/gradle needed
 cd e2e && npm run test:contract         # 13 assertions, no Appium/device needed
@@ -237,6 +256,11 @@ Currently caught:
 | Scheme | treat *any* skipped testable as fatal | `one skipped and one enabled testable still passes` |
 | Scheme | conflate no-testable with all-skipped | `the all-skipped failure is distinguished…` |
 | Scheme | parse a truncated scheme anyway | `an unterminated testable tag is indeterminate` |
+| Membership | match the bare filename instead of the Sources marker | the navigator-only file is missed |
+| Membership | treat "zero files found" as a pass | `finding zero source files is indeterminate, never a pass` |
+| Membership | tolerate duplicate basenames | `duplicate basenames are indeterminate` |
+| Membership | stop detecting synchronized groups | `a filesystem-synchronized project is indeterminate` |
+| Membership | drop the marker-convention precondition | `a project with no Sources markers is indeterminate` |
 | Appium spec | remove the tap, keeping both assertions | the spec fails on a real emulator (proved, not assumed) |
 | Leak check | plant `bs://` in a spec | the grep reports it (control-tested; a check that cannot fail is worthless) |
 
@@ -323,6 +347,8 @@ Nothing in this README describes a lane without a green CI run behind it. Specif
 | `checkbashisms` would have added nothing | Ten bashism probes: it caught nothing shellcheck missed, and **missed** `set -o pipefail`. Dropped rather than added |
 | The scheme fixtures match real Xcode output | Compared against two native sources — an xcodegen-generated scheme and a hand-maintained Xcode one; both use the multi-line `skipped = "NO"` form |
 | The simulator prep matches exactly, not by prefix | A prefix-only name is rejected with the available list, rather than booting a near-miss device |
+| All four suites fail when they die mid-run | Injected a `set -u` abort into each: all exit 1, against a control with the old trap that exits 0 |
+| The membership guard catches the *subtle* case | Built a project with a `PBXFileReference` and no Sources entry: the bare filename appears **once** (so a naive grep passes) while the `in Sources` marker count is **0** and the guard exits 1 |
 
 ## Roadmap
 

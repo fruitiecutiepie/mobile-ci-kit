@@ -30,7 +30,24 @@ set -eu
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ios_check="$repo_root/bin/ios_test_result_check"
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT INT TERM
+# A COMPLETION SENTINEL, not decoration. macOS's /bin/sh is bash 3.2, where an EXIT trap sees
+# `$? == 0` after a `set -u`/`set -e` abort -- so a harness that dies halfway through exits **0** and
+# reports success. Verified: bash 3.2 gives 0, bash 5 and zsh give 1. A test harness that can die
+# silently is this repo's own subject turned inward, so the trap forces a failure unless the script
+# reached its last line.
+completed=''
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration.
+# shellcheck disable=SC2329,SC2317
+finish() {
+  rc=$?
+  rm -rf "$scratch"
+  # An abort leaves `completed` empty, and macOS bash 3.2 hands the trap $?=0 in that case, so the
+  # sentinel is what turns a half-run suite into a failure.
+  [ -n "$completed" ] || rc=1
+  exit "$rc"
+}
+trap finish EXIT INT TERM
 
 failures=0
 cases=0
@@ -365,6 +382,8 @@ expect_status 'the same fixture fails again once the opt-out is unset' 1 \
 expect_status 'no argument is a usage error, distinct from a verdict' 2
 expect_status 'an unknown option is a usage error' 2 --nope
 expect_status 'a second positional argument is a usage error' 2 one two
+
+completed=1
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

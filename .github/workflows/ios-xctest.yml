@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: ""
+      source-dirs:
+        description: Space-separated source directories to assert target membership for.
+        required: false
+        type: string
+        default: ""
       xcodegen-spec:
         required: false
         type: string
@@ -84,4 +89,5 @@ jobs:
           workspace: ${{ inputs.workspace }}
           simulator: ${{ inputs.simulator }}
           scheme-path: ${{ inputs.scheme-path }}
+          source-dirs: ${{ inputs.source-dirs }}
           xcodegen-spec: ${{ inputs.xcodegen-spec }}
