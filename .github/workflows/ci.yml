@@ -43,9 +43,10 @@ jobs:
 
       # The suite drives --summary-json, so it needs no Xcode and runs here rather than on a macOS
       # runner. Same parse and same assertions as the .xcresult path.
-      - name: Regression suites for both guards
+      - name: Regression suites for every guard
         run: |
           set -eu
+          tests/ios_scheme_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
 
@@ -142,6 +143,7 @@ jobs:
             exit 1
           }
 
+          tests/ios_scheme_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
 
@@ -310,8 +312,10 @@ jobs:
           xcodegen-spec: project.yml
           project: Minimal.xcodeproj
           scheme: Minimal
-          # macos-15 images ship iPhone 16-era simulators; the action lists what is available first,
-          # so a wrong name here is one log line away from the right one rather than a guess.
+          # xcodegen writes the shared scheme here, so it exists by the time the check runs.
+          scheme-path: Minimal.xcodeproj/xcshareddata/xcschemes/Minimal.xcscheme
+          # macos-15 images ship iPhone 16-era simulators; the prep script prints what is actually
+          # available when the name is wrong, so a bad name is one log line away from the right one.
           simulator: iPhone 16
 
   appium-ios:

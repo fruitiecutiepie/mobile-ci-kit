@@ -28,7 +28,10 @@ Every entry is a real observed failure, not a hypothetical.
 | --- | --- | --- |
 | `xcodebuild test` prints a suite tree where every line says `passed`, and `Executed 0 tests` | Test host crashed on launch; XCTest restarted it with nothing left to run. No `** TEST FAILED **` is printed, and the word `crash` never appears | [`bin/ios_test_result_check`](bin/ios_test_result_check) — assert the executed count |
 | iOS suite green for a month, one test file never ran | The `.swift` file was on disk and reviewed, but absent from the Xcode target in `project.pbxproj` | [docs](docs/false-green-tests.md#before-the-run--assert-on-the-scheme) — assert disk files vs target |
-| iOS suite green, zero tests run, scheme looks fine in Xcode | Shared scheme lost its `<TestableReference>`, or has one marked `skipped = "YES"` | [docs](docs/false-green-tests.md#before-the-run--assert-on-the-scheme) — assert the scheme before building |
+| iOS suite green, zero tests run, scheme looks fine in Xcode | Shared scheme lost its `<TestableReference>`, or has one marked `skipped = "YES"` | [`bin/ios_scheme_check`](bin/ios_scheme_check) — assert the scheme *before* building |
+| A scheme check passes on every scheme, including broken ones | Xcode writes attributes on their **own lines**, so `grep 'TestableReference.*skipped'` matches nothing on a real scheme and reports a clean pass on a file it never parsed | track the open tag to its `>`; tolerate `skipped = "YES"` spacing |
+| CI boots a different simulator than you named | A prefix match silently selects `iPhone 16 Pro` when you asked for `iPhone 16`, so you test a device you did not choose | [`bin/gha_prepare_ios_simulator`](bin/gha_prepare_ios_simulator) — exact-name match, and it prints what the image ships |
+| The first test on a fresh simulator flakes | `simctl boot` returns when the boot *begins*; SpringBoard is still coming up. Looks like a flaky test | wait with `simctl bootstatus -b` |
 | A compile error under `src/androidTest/` never fails CI | `:app:assembleDebug` does not compile the `androidTest` source set. "The compile gate is green" ≠ "the tests pass" | [docs](docs/false-green-tests.md#android-the-fourth-mechanism) — run `assembleDebugAndroidTest` *and* `connectedDebugAndroidTest` |
 | A test-count parser is correct in dev and wrong in CI | `xcresulttool` summaries are **not flat**: `devicesAndConfigurations[]` repeats the counts per destination. A whole-text scan reads a per-device count as the run total. The first draft was written against an *empty* bundle, where that array is `[]` | parse top-level members only — see the `summary_counts` awk in the script |
 | A required gate goes permanently red one day, for no code change | `--schema-version` was pinned; Apple retired that version, and CI's Xcode auto-upgrades | don't pin it — assert on the count **fields** and fail closed |
@@ -87,6 +90,22 @@ suppresses `3`, and it is **refused when `CI`/`GITHUB_ACTIONS` is set**.
 
 ---
 
+## `bin/ios_scheme_check`
+
+Asserts an Xcode scheme will actually run tests, **before** you pay for a build.
+
+```sh
+bin/ios_scheme_check App.xcodeproj/xcshareddata/xcschemes/App.xcscheme
+```
+
+Same exit-code contract as the result checks (`0` / `1` gate fired / `2` usage / `3` indeterminate).
+It covers the two *static* causes of a zero-test iOS run — no `<TestableReference>`, or every one
+`skipped = "YES"` — and keeps them distinguishable, because the remedies differ.
+
+**Use it together with `ios_test_result_check`, not instead of it.** They fail at different times: a
+valid scheme proves nothing about runtime, and an executed count cannot tell you the scheme was wrong
+before you spent ten minutes finding out.
+
 ## `bin/android_test_result_check`
 
 Fails an Android instrumentation run that executed nothing.
@@ -120,6 +139,17 @@ reports. This repo's own CI runs it against `examples/minimal-android`, so the a
 behind it rather than a plausible-looking YAML file.
 
 Reasoning, including why the AVD is deliberately **not** cached: **[docs/emulator-in-ci.md](docs/emulator-in-ci.md)**.
+
+## `bin/gha_prepare_emulator_runner` and `bin/gha_prepare_ios_simulator`
+
+The prep each lane needs before it can run, as scripts you can read and copy rather than lines trapped
+in one workflow file — one per platform, so neither is the odd one out.
+
+The Android one installs the KVM udev rule and reclaims disk before boot. The iOS one resolves a
+device name to a udid by **exact** match, boots it only if it is not already booted (`simctl boot`
+errors on a booted device), and waits with `bootstatus -b` because *booted is not ready*. When the
+name is wrong it prints what the image actually ships — otherwise an unknown device surfaces as a
+`-destination` error, which reads like a malformed destination string.
 
 ## `bin/gha_stop_if_superseded` and `bin/gha_cancel_run`
 
@@ -183,9 +213,10 @@ for vendor strings and platform branching, so the boundary is asserted rather th
 ## Tests, and why they are mutation-tested
 
 ```sh
+tests/ios_scheme_check_test             # 20 assertions, fixtures only
 tests/ios_test_result_check_test        # 46 assertions, no Xcode needed
 tests/android_test_result_check_test    # 31 assertions, no emulator/SDK/gradle needed
-cd e2e && npm run test:contract         # 12 assertions, no Appium/device needed
+cd e2e && npm run test:contract         # 13 assertions, no Appium/device needed
 ```
 
 A guard that cannot fail reports success exactly like a working one — which is the bug this repo is
@@ -202,6 +233,10 @@ Currently caught:
 | Android | treat an empty results directory as fine | `an empty results directory is indeterminate, never a pass` |
 | Android | count skipped tests as executed | `an all-skipped run fails` |
 | Android | stop refusing the opt-out under CI | `the opt-out is refused when CI is set` |
+| Scheme | match `skipped` only on the tag's own line (real Xcode format missed) | 5 assertions fail |
+| Scheme | treat *any* skipped testable as fatal | `one skipped and one enabled testable still passes` |
+| Scheme | conflate no-testable with all-skipped | `the all-skipped failure is distinguished…` |
+| Scheme | parse a truncated scheme anyway | `an unterminated testable tag is indeterminate` |
 | Appium spec | remove the tap, keeping both assertions | the spec fails on a real emulator (proved, not assumed) |
 | Leak check | plant `bs://` in a spec | the grep reports it (control-tested; a check that cannot fail is worthless) |
 
@@ -286,6 +321,8 @@ Nothing in this README describes a lane without a green CI run behind it. Specif
 | The awk shim actually takes effect | Requested gawk while shimming mawk; the assertion fired and the step exited 1 |
 | `pipefail` in a `sh` script is caught | `SC3040` under shellcheck 0.9.0 **and** 0.11.0 |
 | `checkbashisms` would have added nothing | Ten bashism probes: it caught nothing shellcheck missed, and **missed** `set -o pipefail`. Dropped rather than added |
+| The scheme fixtures match real Xcode output | Compared against two native sources — an xcodegen-generated scheme and a hand-maintained Xcode one; both use the multi-line `skipped = "NO"` form |
+| The simulator prep matches exactly, not by prefix | A prefix-only name is rejected with the available list, rather than booting a near-miss device |
 
 ## Roadmap
 

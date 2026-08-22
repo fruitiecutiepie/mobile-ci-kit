@@ -1,0 +1,229 @@
+#!/bin/sh
+# ios_scheme_check_test -- regression suite for bin/ios_scheme_check.
+#
+# Fully hermetic: fixtures only, no Xcode, no simulator. That is the whole appeal of a static check --
+# every case it can encounter is expressible as a file.
+#
+# The load-bearing fixture is REAL XCODE FORMATTING. Xcode writes attributes on their own lines:
+#
+#   <TestableReference
+#      skipped = "YES">
+#
+# so a line-oriented `grep 'TestableReference.*skipped'` matches nothing on a real scheme and reports
+# a clean pass on a file it never parsed. Every positive fixture below uses the multi-line form for
+# that reason; a single-line fixture would let a naive implementation pass the whole suite.
+set -eu
+
+# `CDPATH=` is a deliberate one-shot prefix assignment for `cd`, not a broken assignment.
+# shellcheck disable=SC1007
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+check="$repo_root/bin/ios_scheme_check"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT INT TERM
+
+failures=0
+cases=0
+
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/      /' >&2
+  fi
+}
+
+pass() {
+  cases=$((cases + 1))
+  printf 'ok: %s\n' "$1"
+}
+
+if [ -x "$check" ]; then
+  pass 'bin/ios_scheme_check exists and is executable'
+else
+  fail "bin/ios_scheme_check is missing or not executable: $check"
+fi
+
+check_status=0
+check_output=''
+
+expect_status() {
+  description="$1"
+  expect_code="$2"
+  shift 2
+  set +e
+  check_output="$("$check" "$@" 2>&1)"
+  check_status=$?
+  set -e
+  if [ "$check_status" -eq "$expect_code" ]; then
+    pass "$description"
+  else
+    fail "$description (expected exit $expect_code, got $check_status)" "$check_output"
+  fi
+}
+
+# $1 = fixture name, remaining stdin = body inside <Scheme>
+scheme_with() {
+  name="$1"
+  path="$scratch/$name.xcscheme"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<Scheme LastUpgradeVersion = "2600" version = "1.7">'
+    cat
+    printf '%s\n' '</Scheme>'
+  } >"$path"
+  printf '%s\n' "$path"
+}
+
+# --- Control assertion. Every negative case below could be satisfied by a script that rejects all
+# --- input, so a realistic passing scheme must pass first. Real multi-line Xcode formatting.
+ok_scheme="$(scheme_with enabled <<'XML'
+   <TestAction buildConfiguration = "Debug">
+      <Testables>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintName = "AppTests">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'a scheme with an enabled testable passes' 0 "$ok_scheme"
+if printf '%s' "$check_output" | grep -q '1 of 1 testable'; then
+  pass 'the passing message reports the enabled and total counts'
+else
+  fail 'the pass should report enabled-of-total' "$check_output"
+fi
+
+# --- No testable at all: the un-shared / regenerated / bad-merge case.
+none_scheme="$(scheme_with no_testable <<'XML'
+   <TestAction buildConfiguration = "Debug">
+      <Testables>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'a scheme with no testable fails' 1 "$none_scheme"
+if printf '%s' "$check_output" | grep -q 'NO <TestableReference>'; then
+  pass 'the no-testable failure names the missing element'
+else
+  fail 'the no-testable failure should name the missing element' "$check_output"
+fi
+
+# --- Every testable skipped. Distinguished from the above because the remedies differ: one is
+# --- "re-add the target", the other is "untick Skip".
+skipped_scheme="$(scheme_with all_skipped <<'XML'
+   <TestAction buildConfiguration = "Debug">
+      <Testables>
+         <TestableReference
+            skipped = "YES">
+            <BuildableReference BlueprintName = "AppTests"></BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'a scheme whose only testable is skipped fails' 1 "$skipped_scheme"
+if printf '%s' "$check_output" | grep -q 'every <TestableReference> is skipped'; then
+  pass 'the all-skipped failure is distinguished from the no-testable one'
+else
+  fail 'the all-skipped failure should say every testable is skipped' "$check_output"
+fi
+
+# --- Mixed: one skipped, one enabled. Something still runs, so this must PASS. Without this case an
+# --- implementation that fails on ANY skipped testable survives the whole suite.
+mixed_scheme="$(scheme_with mixed <<'XML'
+   <TestAction buildConfiguration = "Debug">
+      <Testables>
+         <TestableReference
+            skipped = "YES">
+            <BuildableReference BlueprintName = "SlowTests"></BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference BlueprintName = "AppTests"></BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'one skipped and one enabled testable still passes' 0 "$mixed_scheme"
+if printf '%s' "$check_output" | grep -q '1 of 2 testable'; then
+  pass 'a mixed scheme reports 1 of 2 enabled'
+else
+  fail 'a mixed scheme should report 1 of 2' "$check_output"
+fi
+
+# --- Two testables, both skipped: the count path, not just the boolean.
+both_skipped="$(scheme_with both_skipped <<'XML'
+   <TestAction buildConfiguration = "Debug">
+      <Testables>
+         <TestableReference
+            skipped = "YES">
+            <BuildableReference BlueprintName = "A"></BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "YES">
+            <BuildableReference BlueprintName = "B"></BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'two testables both skipped fails' 1 "$both_skipped"
+if printf '%s' "$check_output" | grep -q '2 of 2'; then
+  pass 'the all-skipped message reports the skipped-of-total counts'
+else
+  fail 'the all-skipped message should report 2 of 2' "$check_output"
+fi
+
+# --- SPACING. Xcode writes `skipped = "YES"`; a fixture using `skipped="YES"` would let an
+# --- implementation that only handles the tight form pass. Cover the tight form too, since
+# --- hand-edited and generated schemes both exist.
+tight_scheme="$(scheme_with tight <<'XML'
+   <TestAction><Testables><TestableReference skipped="YES"><BuildableReference/></TestableReference></Testables></TestAction>
+XML
+)"
+expect_status 'a single-line tag with no spaces around = is still detected as skipped' 1 "$tight_scheme"
+
+# --- A testable with no `skipped` attribute at all defaults to enabled, which is how Xcode treats it.
+no_attr="$(scheme_with no_attr <<'XML'
+   <TestAction>
+      <Testables>
+         <TestableReference>
+            <BuildableReference BlueprintName = "AppTests"></BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+XML
+)"
+expect_status 'a testable with no skipped attribute counts as enabled' 0 "$no_attr"
+
+# --- Fail closed on anything unreadable, and distinguishably (3, never 1). ---
+expect_status 'a missing scheme file is indeterminate, not a verdict' 3 "$scratch/does-not-exist.xcscheme"
+if printf '%s' "$check_output" | grep -q 'xcshareddata'; then
+  pass 'the missing-file message points at the shared-scheme path'
+else
+  fail 'the missing-file message should name where a shared scheme lives' "$check_output"
+fi
+
+printf '%s\n' 'not xml at all' >"$scratch/garbage.xcscheme"
+expect_status 'a file with no <Scheme> element is indeterminate' 3 "$scratch/garbage.xcscheme"
+
+# --- A truncated tag must not yield counts from a partial parse.
+printf '%s\n%s\n' '<Scheme version = "1.7">' '   <TestableReference' >"$scratch/truncated.xcscheme"
+expect_status 'an unterminated testable tag is indeterminate, not a guess' 3 "$scratch/truncated.xcscheme"
+
+# --- Usage errors are distinct from verdicts. ---
+expect_status 'no argument is a usage error' 2
+expect_status 'an unknown option is a usage error' 2 --nope
+expect_status 'a second positional argument is a usage error' 2 one two
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf 'ios_scheme_check_test: %d failure(s) across %d passing assertion(s)\n' "$failures" "$cases" >&2
+  exit 1
+fi
+printf 'ios_scheme_check_test: %d assertion(s) passed\n' "$cases"

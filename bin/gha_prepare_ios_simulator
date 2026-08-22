@@ -1,0 +1,141 @@
+#!/bin/sh
+# gha_prepare_ios_simulator -- boot a named iOS simulator deterministically and report its udid.
+#
+# The iOS counterpart of bin/gha_prepare_emulator_runner, and it exists for the same reason: the
+# prep a lane needs before it can run should be a script you can read, copy and test, not lines
+# trapped inside one workflow file.
+#
+# Simulators need NO code signing, which is what makes an iOS lane viable in open CI with no Apple
+# Developer account. What they do need is care about three things, each of which fails in a way that
+# points somewhere else:
+#
+# 1. THE NAME MIGHT NOT EXIST ON THIS IMAGE. Runner images ship whichever simulators they ship, and
+#    the names change between image versions. `xcodebuild` responds to an unknown device with an
+#    error about the DESTINATION, which reads like a malformed `-destination` string rather than "no
+#    such device". This script fails early and prints what the image actually has.
+#
+# 2. `simctl boot` ERRORS ON AN ALREADY-BOOTED DEVICE. So a lane that boots unconditionally breaks on
+#    its second run, or on any image where something else booted a simulator first. The state is
+#    checked rather than assumed.
+#
+# 3. "BOOTED" IS NOT "READY". `simctl boot` returns as soon as the boot begins; a test that starts
+#    immediately can fail on a simulator still bringing up SpringBoard. `simctl bootstatus -b` is the
+#    wait, and skipping it produces a flake that looks like a bad test.
+#
+# Prints `IOS_SIMULATOR_UDID=<udid>` on stdout, and appends the same to $GITHUB_ENV when that is set,
+# so the caller can pin the exact device rather than letting a tool pick or create one -- faster, and
+# deterministic across a matrix.
+#
+# Usage:
+#   gha_prepare_ios_simulator <device-name>
+#     e.g. gha_prepare_ios_simulator 'iPhone 16'
+#
+# Exit codes, matching this repo's other scripts:
+#   0  the named simulator is booted and ready; its udid was reported
+#   2  usage error
+#   3  indeterminate: not macOS, no `xcrun`, no such device, or the boot never completed. Fail
+#      closed -- a lane that proceeds without a device produces a confusing downstream error instead
+#      of this one.
+#
+# Requires POSIX sh and `xcrun simctl` (macOS). No jq, no Python.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+label='gha-prepare-ios-simulator'
+
+note() {
+  printf '%s: %s\n' "$label" "$1" >&2
+}
+
+usage() {
+  printf '%s\n' "Usage: gha_prepare_ios_simulator <device-name>"
+}
+
+case "${1:-}" in
+  '')
+    usage >&2
+    exit 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+device_name="$1"
+
+if [ "$(uname -s)" != 'Darwin' ]; then
+  note "not macOS ($(uname -s)); iOS simulators are unavailable here."
+  exit 3
+fi
+
+if ! command -v xcrun >/dev/null 2>&1; then
+  note 'xcrun not found, so simctl cannot be reached. Is Xcode installed?'
+  exit 3
+fi
+
+# Resolve the name to a udid. Matching on the name anchored at the start of the trimmed line avoids
+# the classic near-miss where "iPhone 16" also matches "iPhone 16 Pro" and boots the wrong device.
+udid="$(
+  xcrun simctl list devices available 2>/dev/null | awk -v want="$device_name" '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      # A device line looks like: Name (UDID) (State)
+      p = index(line, " (")
+      if (p == 0) { next }
+      name = substr(line, 1, p - 1)
+      if (name != want) { next }
+      rest = substr(line, p + 2)
+      c = index(rest, ")")
+      if (c == 0) { next }
+      print substr(rest, 1, c - 1)
+      exit
+    }
+  '
+)" || udid=''
+
+if [ -z "$udid" ]; then
+  note "no AVAILABLE simulator named exactly: $device_name"
+  note 'This runner image ships these instead:'
+  xcrun simctl list devices available 2>/dev/null | sed -n '1,40p' | sed "s/^/$label:   /" >&2 || true
+  note 'Pass a name from that list. Note the match is exact, so "iPhone 16" will not select'
+  note '"iPhone 16 Pro" -- which is the point, since a silent substitution changes what you tested.'
+  exit 3
+fi
+
+note "resolved '$device_name' to $udid"
+
+# `simctl boot` on an already-booted device is an error, so check first rather than papering over it
+# with `|| true` -- which would also swallow a real boot failure.
+state="$(xcrun simctl list devices 2>/dev/null | grep "$udid" | sed -n 's/.*(\([A-Za-z]*\))[ \t]*$/\1/p' | head -1)"
+if [ "$state" = 'Booted' ]; then
+  note 'already booted'
+else
+  note "booting (current state: ${state:-unknown})"
+  if ! xcrun simctl boot "$udid" 2>&1 | sed "s/^/$label:   /" >&2; then
+    note 'boot command failed'
+    exit 3
+  fi
+fi
+
+# Booted != ready. Without this wait the first test can land while SpringBoard is still coming up,
+# and the failure looks like a flaky test rather than a race with the boot.
+note 'waiting for boot to complete'
+if ! xcrun simctl bootstatus "$udid" -b 2>&1 | sed "s/^/$label:   /" >&2; then
+  note 'bootstatus reported failure; the simulator is not usable'
+  exit 3
+fi
+
+printf 'IOS_SIMULATOR_UDID=%s\n' "$udid"
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf 'IOS_SIMULATOR_UDID=%s\n' "$udid" >> "$GITHUB_ENV"
+  note "exported IOS_SIMULATOR_UDID to \$GITHUB_ENV"
+fi
+note 'ready'

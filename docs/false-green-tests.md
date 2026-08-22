@@ -27,8 +27,25 @@ Both of these are visible in the `.xcscheme` without launching anything:
    compiles; it is simply no longer part of what `xcodebuild test` runs.
 2. **A `<TestableReference>` is present but marked `skipped = "YES"`.**
 
-Assert the scheme *before* `xcodebuild` runs. Both are static facts; there is no reason to pay for a
-build to discover them.
+Assert the scheme *before* `xcodebuild` runs — `bin/ios_scheme_check` does exactly this and nothing
+else. Both are static facts; there is no reason to pay for a build to discover them.
+
+**One trap if you write your own:** Xcode does not put attributes on the same line as the tag. A real
+scheme reads
+
+```xml
+<TestableReference
+   skipped = "NO"
+   parallelizable = "NO">
+```
+
+so `grep 'TestableReference.*skipped'` matches **nothing** on a real scheme and reports a clean pass
+on a file it never parsed. Track the open tag to its closing `>`, and tolerate the spaces around `=`.
+Verified against two native sources: an xcodegen-generated scheme and a hand-maintained Xcode one.
+
+The two causes need to stay *distinguishable*, because the remedies differ — "re-add the test target
+and re-share the scheme" versus "untick Skip". A guard that collapses them sends the reader hunting
+for a skip flag that is not there.
 
 A related trap on the same theme, which no scheme check catches: **a source file absent from the
 Xcode target is not compiled and not run.** In the repo these notes come from, a Swift test file sat
@@ -53,6 +70,10 @@ The scheme can be perfectly valid and the run still execute nothing:
 
 Pass `-resultBundlePath` and assert a non-zero executed count. `bin/ios_test_result_check` in this
 repo does exactly that, and nothing else.
+
+**You want both halves.** A valid scheme proves nothing about what happened at runtime, and an
+executed count cannot tell you the scheme was misconfigured before you spent the ten minutes finding
+out. They fail at different times, so they are separate checks.
 
 ### Three traps in reading that verdict
 

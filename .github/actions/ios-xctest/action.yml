@@ -25,6 +25,14 @@ inputs:
       simulators it ships -- so pass one you have confirmed exists on your runner.
     required: false
     default: "iPhone 17"
+  scheme-path:
+    description: >-
+      Path to the shared .xcscheme, relative to working-directory, e.g.
+      `App.xcodeproj/xcshareddata/xcschemes/App.xcscheme`. When set, the scheme is asserted to have an
+      enabled testable BEFORE the build -- the two static causes of a zero-test run cost milliseconds
+      to rule out and minutes to discover from a build. Leave empty to skip that check.
+    required: false
+    default: ""
   xcodegen-spec:
     description: >-
       If set, run `xcodegen generate` with this spec before building. For projects whose .xcodeproj is
@@ -46,11 +54,39 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: xcodegen generate --spec '${{ inputs.xcodegen-spec }}'
 
-    # Listed on purpose: when a simulator name turns out not to exist on the runner image, the
-    # xcodebuild error is about a destination rather than about a name, and this log is the answer.
-    - name: List available simulators
+    # BEFORE the build, because both causes are static facts in the .xcscheme and a build costs
+    # minutes to tell you the same thing. Skipped when `scheme-path` is not supplied, since a
+    # generated project's scheme does not exist until after xcodegen runs -- in that case the path is
+    # under the generated .xcodeproj and the caller knows it.
+    - name: Assert the scheme will run tests
+      if: ${{ inputs.scheme-path != '' }}
       shell: bash
-      run: xcrun simctl list devices available | sed -n '1,40p'
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CHECK: ${{ github.action_path }}/../../../bin/ios_scheme_check
+      run: |
+        set -euo pipefail
+        if [ ! -x "$CHECK" ]; then
+          printf 'error: guard not found or not executable at %s\n' "$CHECK" >&2
+          exit 1
+        fi
+        "$CHECK" '${{ inputs.scheme-path }}'
+
+    # Boot the simulator via the shared script rather than inline `simctl`, so the prep is readable,
+    # copyable and exercised the same way the Android side is. It also prints what the image actually
+    # ships when the name is wrong -- an unknown device otherwise surfaces as a `-destination` error,
+    # which reads like a malformed destination string.
+    - name: Boot the simulator
+      shell: bash
+      env:
+        PREPARE: ${{ github.action_path }}/../../../bin/gha_prepare_ios_simulator
+      run: |
+        set -euo pipefail
+        if [ ! -x "$PREPARE" ]; then
+          printf 'error: %s not found or not executable\n' "$PREPARE" >&2
+          exit 1
+        fi
+        "$PREPARE" '${{ inputs.simulator }}'
 
     - name: Run tests
       shell: bash

@@ -37,6 +37,13 @@ on:
         required: false
         type: string
         default: "iPhone 16"
+      scheme-path:
+        description: >-
+          Path to the shared .xcscheme, relative to working-directory. When set, the scheme is
+          asserted to have an enabled testable before the build.
+        required: false
+        type: string
+        default: ""
       xcodegen-spec:
         required: false
         type: string
@@ -76,4 +83,5 @@ jobs:
           project: ${{ inputs.project }}
           workspace: ${{ inputs.workspace }}
           simulator: ${{ inputs.simulator }}
+          scheme-path: ${{ inputs.scheme-path }}
           xcodegen-spec: ${{ inputs.xcodegen-spec }}

@@ -1,0 +1,198 @@
+#!/bin/sh
+# ios_scheme_check -- assert an Xcode scheme will actually run tests, BEFORE you pay for a build.
+#
+# `xcodebuild test` reports success having run zero tests when the scheme's test action is empty. Two
+# static causes, both visible in the `.xcscheme` without launching anything:
+#
+#   * the shared scheme has NO `<TestableReference>` -- un-sharing the scheme in Xcode, project
+#     regeneration, or a bad merge in `project.pbxproj` all do this. The test target still exists and
+#     still compiles; it is simply no longer part of what `xcodebuild test` runs.
+#   * a `<TestableReference>` is present but carries `skipped = "YES"`.
+#
+# These are the cheap half of the false-green problem: static facts, checkable in milliseconds, with
+# no simulator and no build. Assert them first. The expensive half -- a test host that crashes on
+# launch, so the scheme is valid and the run still executes nothing -- is what
+# `bin/ios_test_result_check` covers AFTER the run. You want both: a valid scheme proves nothing about
+# what happened at runtime, and an executed count cannot tell you the scheme was misconfigured
+# before you spent ten minutes finding out.
+#
+# Usage:
+#   ios_scheme_check <path-to-.xcscheme>
+#
+# Exit codes, matching this repo's other guards so a caller can tell the reasons apart:
+#   0  at least one testable is present and not skipped
+#   1  the gate firing -- no testable, or every testable skipped
+#   2  usage error
+#   3  indeterminate: the file is missing, unreadable, or not a scheme this script recognises.
+#      Fail closed. "I could not read the scheme" is a different claim from "the scheme runs no
+#      tests", and only the second is a verdict about your project.
+#
+# THE PARSING TRAP. Xcode does not write attributes on the same line as the tag. A real scheme looks
+# like:
+#
+#   <TestableReference
+#      skipped = "NO"
+#      parallelizable = "YES">
+#      <BuildableReference ... />
+#   </TestableReference>
+#
+# So a line-oriented `grep 'TestableReference.*skipped'` matches NOTHING on a real scheme and reports
+# a clean pass on a file it never understood. The scan below tracks the open tag until its closing
+# `>`, and tolerates spaces around `=` because Xcode writes `skipped = "YES"`, not `skipped="YES"`.
+#
+# Requires POSIX sh and awk only. No xmllint, no plutil, no Ruby -- this must run on any runner, and
+# on Ubuntu `awk` is mawk, so the scan avoids ERE interval quantifiers.
+#
+# Part of mobile-ci-kit. MIT licensed -- copy this file into your own repo freely.
+set -eu
+
+label='ios-scheme-check'
+
+note() {
+  printf '%s: %s\n' "$label" "$1" >&2
+}
+
+usage() {
+  printf '%s\n' 'Usage: ios_scheme_check <path-to-.xcscheme>'
+}
+
+case "${1:-}" in
+  '')
+    usage >&2
+    exit 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    note "unknown option: $1"
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+scheme="$1"
+
+if [ ! -f "$scheme" ]; then
+  note "no scheme file at: $scheme"
+  note 'A shared scheme lives at'
+  note '  <project>.xcodeproj/xcshareddata/xcschemes/<Name>.xcscheme'
+  note 'If that path does not exist the scheme is not shared, which is itself a cause of a zero-test'
+  note 'run: an unshared scheme is invisible to CI. Share it in Xcode (Product > Scheme > Manage).'
+  exit 3
+fi
+
+if [ ! -r "$scheme" ]; then
+  note "scheme file is not readable: $scheme"
+  exit 3
+fi
+
+# Emits one line: `OK <testables> <skipped>` or `ERR <reason>`.
+#
+# Counting BOTH totals rather than a single boolean is deliberate: "no testable at all" and "every
+# testable skipped" have different remedies, and a caller that cannot tell them apart sends the reader
+# to look for a skip flag that is not there.
+scheme_counts() {
+  awk '
+    BEGIN { in_tag = 0; testables = 0; skipped = 0; tag_skipped = 0; saw_scheme = 0 }
+    index($0, "<Scheme") { saw_scheme = 1 }
+    {
+      line = $0
+      # Walk the line so several tags on one line, or a tag closing mid-line, are handled. Xcode does
+      # not currently write them that way, and relying on that would be relying on a formatter.
+      while (length(line) > 0) {
+        if (!in_tag) {
+          p = index(line, "<TestableReference")
+          if (p == 0) { break }
+          in_tag = 1
+          tag_skipped = 0
+          testables += 1
+          line = substr(line, p + 18)
+          continue
+        }
+        # Inside an open <TestableReference ...> tag: look for the skip attribute and the close.
+        if (match(line, /skipped[ \t]*=[ \t]*"YES"/)) { tag_skipped = 1 }
+        c = index(line, ">")
+        if (c == 0) { break }
+        if (tag_skipped) { skipped += 1 }
+        in_tag = 0
+        line = substr(line, c + 1)
+      }
+    }
+    END {
+      # An unterminated tag means the file is truncated or not the XML we think it is. Fail closed
+      # rather than reporting counts derived from a partial parse.
+      if (in_tag) { print "ERR unterminated-testable-tag"; exit 0 }
+      if (!saw_scheme) { print "ERR no-scheme-element"; exit 0 }
+      printf "OK %d %d\n", testables, skipped
+    }
+  ' "$scheme"
+}
+
+# shellcheck disable=SC2046
+set -- $(scheme_counts)
+
+case "${1:-}" in
+  OK) ;;
+  ERR)
+    case "${2:-}" in
+      no-scheme-element)
+        note "not an Xcode scheme (no <Scheme> element): $scheme"
+        note 'Refusing to report on a file this script does not recognise.'
+        ;;
+      unterminated-testable-tag)
+        note "a <TestableReference> tag is never closed in: $scheme"
+        note 'The file is truncated or is not the XML this script expects. Counts from a partial'
+        note 'parse would be a guess, so this fails closed instead.'
+        ;;
+      *)
+        note "could not read the scheme: ${2:-unknown}"
+        ;;
+    esac
+    exit 3
+    ;;
+  *)
+    note 'could not read any counts out of the scheme.'
+    note 'Neither an OK nor an ERR line came back, so this is not a file this script knows.'
+    exit 3
+    ;;
+esac
+
+testables="$2"
+skipped="$3"
+
+for count_name in testables:"$testables" skipped:"$skipped"; do
+  count_value="${count_name#*:}"
+  case "$count_value" in
+    '' | *[!0-9]*)
+      note "\"${count_name%%:*}\" is not a non-negative integer: $count_value"
+      exit 3
+      ;;
+  esac
+done
+
+enabled=$((testables - skipped))
+
+if [ "$testables" -gt 0 ] && [ "$enabled" -gt 0 ]; then
+  printf '%s: OK (%d of %d testable(s) enabled; %s)\n' "$label" "$enabled" "$testables" "$scheme"
+  exit 0
+fi
+
+if [ "$testables" -eq 0 ]; then
+  note "the scheme has NO <TestableReference>, so \`xcodebuild test\` would run nothing ($scheme)"
+  note 'The test target still exists and still compiles; it is just not part of the test action.'
+  note 'Causes: the scheme was un-shared and re-created, the project was regenerated, or a merge in'
+  note 'project.pbxproj dropped it. Fix in Xcode: Product > Scheme > Edit Scheme > Test > add the'
+  note 'test target, then re-share the scheme so CI sees the same one you do.'
+else
+  note "every <TestableReference> is skipped ($skipped of $testables), so nothing would run ($scheme)"
+  note 'Fix in Xcode: Product > Scheme > Edit Scheme > Test, and untick "Skip" on the test target.'
+  note 'A skipped testable is easy to leave behind after debugging one failing suite.'
+fi
+exit 1
