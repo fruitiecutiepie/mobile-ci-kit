@@ -50,6 +50,10 @@ jobs:
           tests/ios_target_membership_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
+          # The guard on the guards: asserts each suite above FAILS when it dies partway through,
+          # instead of reporting the assertions it reached. Runs last so a real suite failure is
+          # reported before this meta-check adds noise.
+          tests/harness_abort_sentinel_test
 
   lint:
     name: shellcheck ${{ matrix.shellcheck }}
@@ -148,6 +152,10 @@ jobs:
           tests/ios_target_membership_check_test
           tests/ios_test_result_check_test
           tests/android_test_result_check_test
+          # The guard on the guards: asserts each suite above FAILS when it dies partway through,
+          # instead of reporting the assertions it reached. Runs last so a real suite failure is
+          # reported before this meta-check adds noise.
+          tests/harness_abort_sentinel_test
 
   android:
     name: Android instrumentation on an emulator (API ${{ matrix.api-level }})
