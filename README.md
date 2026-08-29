@@ -46,12 +46,18 @@ Every entry is a real observed failure, not a hypothetical.
 | Switching device farms means editing every test | The farm's uploaded-app handle, vendor capability namespace, or device names leaked into specs | [provider boundary](e2e/providers/provider.ts) — three methods; assert it with a grep in CI |
 | A device class silently resolves to nothing on one farm | Nothing forced each provider to handle every class | [contract test](e2e/support/provider.contract.test.ts) — assert every class on every platform |
 | A test harness dies halfway through and reports success | macOS `/bin/sh` is bash 3.2, where an `EXIT` trap sees `$?==0` after a `set -u` abort. Local-only, so CI never contradicts you | a completion sentinel — [docs](docs/ci-traps.md) |
+| An Xcode job on a self-hosted Mac prints a few hundred lines, then nothing, until the timeout kills it | The runner service installer writes `SessionCreate: true` into its LaunchAgent plist, so each job gets its **own** security session instead of the logged-in GUI one, and Xcode's build machinery blocks there. Reads as a slow build, so the tempting fix is a bigger `timeout-minutes` | [docs](docs/self-hosted-macos.md) — read the output **rate**, not the elapsed time; set the key to `false` |
 | A CI lint finding nobody can reproduce locally | The linter was installed unpinned (`apt-get install shellcheck`). Versions emit **different check IDs for the same code** — 0.9.0 flags `SC2317` on a trap-invoked function's body where 0.11.0 flags `SC2329` on its declaration — so `# shellcheck disable=` directives stop matching | [`ci.yml`](.github/workflows/ci.yml) — pin the version, **assert the pin took effect**, and lint under every version you claim to support |
 
 | A check script works on your Mac and misbehaves on the runner | Ubuntu's `/usr/bin/awk` is **mawk**, macOS ships BSD awk. mawk's `{n,m}` interval quantifiers cannot be relied on, and the failure can be a silent "matched nothing" | [`ci.yml`](.github/workflows/ci.yml) — run the suites under **both** mawk and gawk, and assert the shim took effect |
 | A mid-pipeline failure reads downstream as "found nothing" | POSIX `sh` has no `pipefail`; only the last stage's status survives. Two failed reads both yield `""`, so `"" = ""` reports "same" and the caller acts on a conclusion it never computed | already gated: `shellcheck --shell=sh` reports **SC3040** for `set -o pipefail` in a `sh` script, under both pinned versions |
 
 Full reasoning: **[docs/false-green-tests.md](docs/false-green-tests.md)**.
+
+**Running the iOS lane on your own Mac:** [docs/self-hosted-macos.md](docs/self-hosted-macos.md) —
+the LaunchAgent key that blocks every Xcode build, the three-row comparison that tells a blocked build
+apart from a slow one, and why no gate in this repo can catch it: the fix is state on a machine, not a
+line in a file.
 
 **Twenty entries, indexed by symptom:** [docs/ci-traps.md](docs/ci-traps.md) — traps where the first
 plausible explanation is wrong, across shell portability, git, the Actions platform, builds that exit

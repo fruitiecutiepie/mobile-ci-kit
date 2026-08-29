@@ -206,6 +206,13 @@ appears in some required-set; everything the required-set references is also in 
 required-set key is a real declared classifier output. Deliberately-advisory jobs belong on an explicit
 allowlist with a comment, so "advisory" is a decision rather than an oversight.
 
+### A self-hosted macOS runner runs Xcode in its own security session, and the build blocks
+
+Already documented on its own page: [docs/self-hosted-macos.md](self-hosted-macos.md). The runner
+service installer writes `SessionCreate: true` into its LaunchAgent plist, Xcode's build machinery
+blocks in that context, and the job dies at its timeout having printed the toolchain probes and
+nothing after them. It reads as a slow build.
+
 ### `if: always()` makes a job structurally uncancellable
 
 Already documented where it is load-bearing:
