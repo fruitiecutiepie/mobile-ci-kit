@@ -1,0 +1,169 @@
+#!/bin/sh
+# harness_abort_sentinel_test -- the guard on the guards.
+#
+# Asserts that every suite in tests/ FAILS when it dies partway through, rather than reporting the
+# assertions it managed to reach. Without this, a suite that aborts at line 30 of 300 prints some
+# `ok:` lines, exits 0, and reads as a pass.
+#
+# WHY THIS EXISTS AS A COMMITTED SCRIPT. The behaviour was originally verified by hand, once, in a
+# terminal -- which proves nothing to anyone else and cannot be re-run. A review of the decision trail
+# flagged exactly that: the claim had no re-runnable evidence. This file is the evidence.
+#
+# THE BUG IT GUARDS AGAINST. macOS `/bin/sh` is bash 3.2, whose EXIT trap sees `$? == 0` after a
+# `set -u` or `set -e` abort. So the ordinary cleanup trap
+#
+#     trap 'rm -rf "$scratch"' EXIT INT TERM
+#
+# makes an aborting script exit 0. Measured: bash 3.2 -> 0, bash 5 -> 1, zsh -> 1, dash -> 1. It is a
+# LOCAL-only false green, which is the worse kind: local is where the iterating happens, and CI never
+# contradicts you. The fix is a completion sentinel; see docs/ci-traps.md.
+#
+# Usage: tests/harness_abort_sentinel_test
+# Exit:  0 every suite fails when aborted, 1 otherwise.
+set -eu
+
+# `CDPATH=` is a deliberate one-shot prefix assignment for `cd`, not a broken assignment.
+# shellcheck disable=SC1007
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+scratch="$(mktemp -d)"
+
+# This suite needs the same protection it is asserting, so it carries the sentinel too.
+completed=''
+# Invoked by the `trap` below, which the linter cannot see. Both IDs are listed on purpose:
+# version 0.9.x reports SC2317 on the body while 0.11.x reports SC2329 on the declaration.
+# shellcheck disable=SC2329,SC2317
+finish() {
+  rc=$?
+  rm -rf "$scratch"
+  [ -n "$completed" ] || rc=1
+  exit "$rc"
+}
+trap finish EXIT INT TERM
+
+failures=0
+cases=0
+
+fail() {
+  failures=$((failures + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/      /' >&2
+  fi
+}
+
+pass() {
+  cases=$((cases + 1))
+  printf 'ok: %s\n' "$1"
+}
+
+# Copy $1 to $2 with an abort injected before its first assertion. Fails loudly if the injection did
+# not change the file: an injection that silently does nothing makes every case below vacuous, which
+# is the same failure mode this whole repo is about.
+inject_abort() {
+  src="$1"
+  dst="$2"
+  awk '
+    !done && /^expect_status / {
+      print "printf \"%s\\n\" \"$harness_abort_sentinel_probe\""
+      done = 1
+    }
+    { print }
+  ' "$src" > "$dst"
+  chmod +x "$dst"
+  if cmp -s "$src" "$dst"; then
+    return 1
+  fi
+  return 0
+}
+
+# Does THIS shell mask an abort behind a plain cleanup trap? bash 3.2 does; dash, zsh and bash 5 do
+# not. Probed rather than assumed, because it decides whether the control below is meaningful here.
+probe="$scratch/probe.sh"
+cat > "$probe" <<'PROBE'
+#!/bin/sh
+set -eu
+d="$(mktemp -d)"
+trap 'rm -rf "$d"' EXIT INT TERM
+printf '%s\n' "$definitely_unbound_probe_var"
+PROBE
+chmod +x "$probe"
+set +e
+"$probe" >/dev/null 2>&1
+probe_status=$?
+set -e
+
+if [ "$probe_status" -eq 0 ]; then
+  shell_masks_abort=1
+  pass 'this shell MASKS an abort behind a plain cleanup trap (bash 3.2 behaviour), so the control below is meaningful'
+else
+  shell_masks_abort=''
+  pass "this shell propagates an abort (exit $probe_status) without a sentinel, so the control below is reported but not asserted"
+fi
+
+suite_count=0
+for suite in "$repo_root"/tests/*_test; do
+  name="$(basename "$suite")"
+  # Skip self: injecting an abort into this file would abort the run doing the injecting.
+  [ "$name" != 'harness_abort_sentinel_test' ] || continue
+  suite_count=$((suite_count + 1))
+
+  # 1. The suite as it stands must FAIL when aborted.
+  aborted="$scratch/$name.aborted"
+  if inject_abort "$suite" "$aborted"; then
+    pass "$name: abort injected (file changed)"
+  else
+    fail "$name: abort injection did not change the file, so the case below would prove nothing"
+    continue
+  fi
+  set +e
+  "$aborted" >/dev/null 2>&1
+  aborted_status=$?
+  set -e
+  if [ "$aborted_status" -ne 0 ]; then
+    pass "$name: exits $aborted_status when it dies partway through"
+  else
+    fail "$name: exited 0 after aborting -- a half-run suite is reporting success"
+  fi
+
+  # 2. CONTROL. With the sentinel removed, the same abort must be MASKED on a shell that masks it.
+  #    Without this, case 1 could be passing for a reason unrelated to the sentinel.
+  unguarded="$scratch/$name.unguarded"
+  # Single quotes are required, not accidental: the `$completed` here is a literal to match in the
+  # target file, not a variable to expand in this one.
+  # shellcheck disable=SC2016
+  sed 's/^  \[ -n "\$completed" \] || rc=1$/  : "no sentinel"/' "$aborted" > "$unguarded"
+  chmod +x "$unguarded"
+  if cmp -s "$aborted" "$unguarded"; then
+    fail "$name: could not remove the sentinel, so the control proves nothing"
+    continue
+  fi
+  set +e
+  "$unguarded" >/dev/null 2>&1
+  unguarded_status=$?
+  set -e
+  if [ -n "$shell_masks_abort" ]; then
+    if [ "$unguarded_status" -eq 0 ]; then
+      pass "$name: without the sentinel the same abort exits 0 -- the sentinel is what fixes it"
+    else
+      fail "$name: control exited $unguarded_status; expected 0 on a masking shell, so the sentinel may not be what is doing the work"
+    fi
+  else
+    pass "$name: control exited $unguarded_status on a non-masking shell (not asserted here; run on macOS /bin/sh to exercise it)"
+  fi
+done
+
+# A loop over a glob that matched nothing exits 0 and looks exactly like a clean pass.
+if [ "$suite_count" -eq 0 ]; then
+  fail 'no suites were found to check, so this proved nothing'
+else
+  pass "checked $suite_count suite(s)"
+fi
+
+completed=1
+
+printf '\n'
+if [ "$failures" -ne 0 ]; then
+  printf 'harness_abort_sentinel_test: %d failure(s) across %d passing assertion(s)\n' "$failures" "$cases" >&2
+  exit 1
+fi
+printf 'harness_abort_sentinel_test: %d assertion(s) passed\n' "$cases"

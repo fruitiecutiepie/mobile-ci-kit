@@ -235,8 +235,13 @@ tests/ios_scheme_check_test             # 20 assertions, fixtures only
 tests/ios_target_membership_check_test  # 24 assertions, fixtures only
 tests/ios_test_result_check_test        # 46 assertions, no Xcode needed
 tests/android_test_result_check_test    # 31 assertions, no emulator/SDK/gradle needed
+tests/harness_abort_sentinel_test        # 14 assertions -- the guard on the guards
 cd e2e && npm run test:contract         # 13 assertions, no Appium/device needed
 ```
+
+`harness_abort_sentinel_test` asserts every other suite **fails when it dies partway through**, with a
+live control: it removes the sentinel and confirms the same abort then exits 0. Without that control
+the check would pass on a shell that never had the bug.
 
 A guard that cannot fail reports success exactly like a working one — which is the bug this repo is
 about, one level up. So the suite is checked by mutating the script and confirming it goes red.
@@ -347,7 +352,7 @@ Nothing in this README describes a lane without a green CI run behind it. Specif
 | `checkbashisms` would have added nothing | Ten bashism probes: it caught nothing shellcheck missed, and **missed** `set -o pipefail`. Dropped rather than added |
 | The scheme fixtures match real Xcode output | Compared against two native sources — an xcodegen-generated scheme and a hand-maintained Xcode one; both use the multi-line `skipped = "NO"` form |
 | The simulator prep matches exactly, not by prefix | A prefix-only name is rejected with the available list, rather than booting a near-miss device |
-| All four suites fail when they die mid-run | Injected a `set -u` abort into each: all exit 1, against a control with the old trap that exits 0 |
+| All four suites fail when they die mid-run | [`tests/harness_abort_sentinel_test`](tests/harness_abort_sentinel_test) — injects an abort into each suite, asserts non-zero, then removes the sentinel and asserts the same abort exits 0. Runs in CI |
 | The membership guard catches the *subtle* case | Built a project with a `PBXFileReference` and no Sources entry: the bare filename appears **once** (so a naive grep passes) while the `in Sources` marker count is **0** and the guard exits 1 |
 
 ## Roadmap

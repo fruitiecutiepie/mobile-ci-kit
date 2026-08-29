@@ -81,9 +81,11 @@ trap 'rc=$?; rm -rf "$scratch"; [ -n "$completed" ] || rc=1; exit "$rc"' EXIT IN
 completed=1   # immediately before the summary
 ```
 
-All four suites in this repo had the flaw and now carry the sentinel; each was verified by injecting a
-mid-script abort and confirming a non-zero exit, against a control still using the old trap that
-exits 0.
+All four suites in this repo had the flaw and now carry the sentinel. That is **asserted on every
+push**, not checked once by hand: `tests/harness_abort_sentinel_test` injects an abort into each
+suite, requires a non-zero exit, then removes the sentinel and requires the same abort to exit 0 —
+because a check that passes on a shell which never had the bug is worth nothing. It probes the shell
+first and says so when the control cannot be exercised there, rather than skipping quietly.
 
 ### An unpinned linter is a reproducibility hole — **measured**
 
